@@ -11,11 +11,13 @@ def home(): return '✅ OKX 급등 감지 봇 작동 중입니다!', 200
 def send_telegram(msg):
     try:
         res = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
+        print(f"📤 텔레그램 응답: {res.status_code}")
         if res.status_code != 200: print("❌ 텔레그램 오류:", res.text)
     except Exception as e: print("❌ 전송 실패:", e)
 
 def get_all_swap_symbols():
     try:
+        print("🔁 종목 목록 가져오는 중...")
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers=headers)
         print(f"🔍 API 응답코드: {res.status_code}")
@@ -26,7 +28,7 @@ def get_all_swap_symbols():
         print(f"✅ 받은 종목 수: {len(data)}")
         return [d['instId'] for d in data]
     except Exception as e:
-        print("❌ 예외 발생:", e)
+        print("❌ 예외 발생 in get_all_swap_symbols:", e)
         return []
 
 def get_ohlcv(symbol, interval):
@@ -37,7 +39,9 @@ def get_ohlcv(symbol, interval):
         raw = res.json()['data']
         df = pd.DataFrame(raw, columns=['ts','open','high','low','close','vol','volCcy']).astype(float).iloc[::-1].reset_index(drop=True)
         return df
-    except: return None
+    except Exception as e:
+        print(f"❌ OHLCV 가져오기 실패 - {symbol}: {e}")
+        return None
 
 def check_conditions(symbol):
     df = get_ohlcv(symbol, '5m')
@@ -53,15 +57,21 @@ def check_conditions(symbol):
         print(msg)
 
 def run_bot():
+    print("🚀 급등 감지 봇 시작됨.")
     symbols = get_all_swap_symbols()
     if not symbols:
+        print("⚠️ 가져온 종목이 없습니다.")
         send_telegram("⚠️ 감시할 종목이 없습니다.")
         return
+    print(f"🎯 감시할 종목 수: {len(symbols)}")
     send_telegram(f"✅ OKX 선물 감시 시작됨 ({len(symbols)}종목)")
     while True:
-        for s in symbols: check_conditions(s); time.sleep(0.3)
+        for s in symbols:
+            check_conditions(s)
+            time.sleep(0.3)
+        print("⏱️ 다음 감시 라운드 대기 중...")
         time.sleep(60)
 
 if __name__ == '__main__':
     threading.Thread(target=run_bot).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 3000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
