@@ -1,64 +1,131 @@
-import requests import pandas as pd import time from ta.volatility import BollingerBands from ta.momentum import RSIIndicator from flask import Flask, request from datetime import datetime
+import requests
+import time
+import pandas as pd
+import ta
+from datetime import datetime
+from flask import Flask
+import threading
 
-app = Flask(name)
+# 텔레그램 설정
+TELEGRAM_TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw'
+TELEGRAM_CHAT_ID = '6786843744'
 
-BOT_TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw' CHAT_ID = '6786843744' INTERVALS = ['5m', '15m']
+# Flask 앱 (Render용)
+app = Flask(__name__)
 
-def send_telegram_message(message): url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage' requests.post(url, json={'chat_id': CHAT_ID, 'text': message})
+@app.route('/')
+def home():
+    return f'✅ OKX 급등 감지 봇 작동 중! ({datetime.utcnow()})'
 
-def get_klines(symbol, interval, limit=100): url = f'https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}' try: res = requests.get(url) data = res.json() if 'data' not in data: raise ValueError(f"No 'data' field in response: {data}") df = pd.DataFrame(data['data'], columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'volCcy', 'volCcyQuote', 'confirm']) df['close'] = df['close'].astype(float) df['high'] = df['high'].astype(float) df['low'] = df['low'].astype(float) df['open'] = df['open'].astype(float) return df.iloc[::-1].reset_index(drop=True) except Exception as e: print(f"{symbol} 캔들 오류: {e}") return None
+# 종목 목록 가져오기 (USDT-SWAP만)
+def get_usdt_swap_symbols():
+    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
-def analyze(symbol): try: df_5m = get_klines(symbol, '5m') df_15m = get_klines(symbol, '15m') if df_5m is None or df_15m is None: return
+        if data.get("code") != "0":
+            print("❌ OKX API 에러 코드:", data.get("code"))
+            return []
 
-# ==== 5분봉 급등 조건 ====
-    close_5m = df_5m['close']
-    rsi_5m = RSIIndicator(close_5m, window=14).rsi()
-    bb_5m = BollingerBands(close_5m, window=20, window_dev=3)
-    bb_upper_5m = bb_5m.bollinger_hband()
+        symbols = [item['instId'] for item in data['data'] if item['instId'].endswith("USDT-SWAP")]
+        print(f"✅ 받은 USDT 종목 수: {len(symbols)}")
+        return symbols
 
-    price_change_5m = (close_5m.iloc[-1] - close_5m.iloc[-2]) / close_5m.iloc[-2] * 100
-    if (
-        price_change_5m >= 1.5
-        and rsi_5m.iloc[-1] >= 70
-        and close_5m.iloc[-1] > bb_upper_5m.iloc[-1]
-    ):
-        send_telegram_message(f'🚀 [5분봉 급등] {symbol}\n상승률: {price_change_5m:.2f}%\nRSI: {rsi_5m.iloc[-1]:.2f}')
+    except Exception as e:
+        print(f"❌ 종목 목록 가져오기 오류: {e}")
+        return []
 
-    # ==== 15분봉 급등 조건 ====
-    close_15m = df_15m['close']
-    rsi_15m = RSIIndicator(close_15m, window=14).rsi()
-    bb_15m = BollingerBands(close_15m, window=20, window_dev=3)
-    bb_upper_15m = bb_15m.bollinger_hband()
+# 캔들 데이터 가져오기
+def get_candles(symbol, interval, limit=100):
+    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if data.get("code") != "0":
+            print(f"❌ {symbol} 캔들 데이터 오류 코드: {data.get('code')}")
+            return None
+        df = pd.DataFrame(data['data'], columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume', 'volume_currency',
+            'buy_volume', 'sell_volume', 'candlesign'
+        ])
+        df = df.iloc[::-1].copy()
+        df['close'] = df['close'].astype(float)
+        return df
+    except Exception as e:
+        print(f"❌ {symbol} 캔들 오류: {e}")
+        return None
 
-    if (
-        rsi_15m.iloc[-1] >= 70
-        and close_15m.iloc[-1] > bb_upper_15m.iloc[-1]
-    ):
-        send_telegram_message(f'🚀 [15분봉 급등] {symbol}\nRSI: {rsi_15m.iloc[-1]:.2f}')
+# 텔레그램 메시지 전송
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': text}
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"❌ 텔레그램 전송 실패: {e}")
 
-    # ==== 5분봉 급락 조건 ====
-    bb_lower_5m = bb_5m.bollinger_lband()
-    if (
-        price_change_5m <= -1.5
-        and rsi_5m.iloc[-1] <= 30
-        and close_5m.iloc[-1] < bb_lower_5m.iloc[-1]
-    ):
-        send_telegram_message(f'⚠️ [5분봉 급락] {symbol}\n하락률: {price_change_5m:.2f}%\nRSI: {rsi_5m.iloc[-1]:.2f}')
+# 조건 확인 함수
+def check_conditions(df, interval):
+    if df is None or len(df) < 30:
+        return None
 
-    # ==== 15분봉 급락 조건 ====
-    bb_lower_15m = bb_15m.bollinger_lband()
-    if (
-        rsi_15m.iloc[-1] <= 30
-        and close_15m.iloc[-1] < bb_lower_15m.iloc[-1]
-    ):
-        send_telegram_message(f'⚠️ [15분봉 급락] {symbol}\nRSI: {rsi_15m.iloc[-1]:.2f}')
+    close = df['close']
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
+    bb = ta.volatility.BollingerBands(close, window=20, window_dev=3)
+    upper = bb.bollinger_hband()
+    lower = bb.bollinger_lband()
 
-except Exception as e:
-    print(f"분석 오류 - {symbol}: {e}")
+    latest_close = close.iloc[-1]
+    previous_close = close.iloc[-2]
+    latest_rsi = rsi.iloc[-1]
+    latest_upper = upper.iloc[-1]
+    latest_lower = lower.iloc[-1]
 
-def get_usdt_symbols(): try: url = 'https://www.okx.com/api/v5/public/instruments?instType=SWAP' res = requests.get(url) data = res.json() symbols = [x['instId'] for x in data['data'] if x['instId'].endswith("-USDT-SWAP")] return symbols except Exception as e: print(f"심볼 조회 오류: {e}") return []
+    change_pct = ((latest_close - previous_close) / previous_close) * 100
 
-@app.route('/') def home(): return f'✅ OKX 급등 감지 봇 작동 중! ({datetime.utcnow()})'
+    # 급등 조건
+    if interval == '5m':
+        if change_pct >= 1.5 and latest_rsi >= 70 and latest_close > latest_upper:
+            return "📈 5분봉 급등 감지"
+    elif interval == '15m':
+        if latest_rsi >= 70 and latest_close > latest_upper:
+            return "📈 15분봉 급등 감지"
 
-if name == 'main': symbols = get_usdt_symbols() send_telegram_message(f'✅ OKX 급등 감지 봇 작동 시작됨\n총 감시 종목 수: **{len(symbols)}**개') for symbol in symbols: analyze(symbol)
+    # 급락 조건
+    if interval == '5m':
+        if change_pct <= -1.5 and latest_rsi <= 30 and latest_close < latest_lower:
+            return "📉 5분봉 급락 감지"
+    elif interval == '15m':
+        if latest_rsi <= 30 and latest_close < latest_lower:
+            return "📉 15분봉 급락 감지"
 
+    return None
+
+# 메인 분석 루프
+def monitor():
+    symbols = get_usdt_swap_symbols()
+    send_telegram_message(f"✅ OKX 급등 감지 봇 작동 시작됨\n총 감시 종목 수: {len(symbols)}개")
+
+    while True:
+        for symbol in symbols:
+            for interval in ['5m', '15m']:
+                df = get_candles(symbol, interval)
+                result = check_conditions(df, interval)
+                if result:
+                    msg = f"{result} 발생!\n종목: {symbol}\n봉 기준: {interval}"
+                    print(msg)
+                    send_telegram_message(msg)
+        time.sleep(30)
+
+# 백그라운드 실행
+def start_monitoring():
+    thread = threading.Thread(target=monitor)
+    thread.daemon = True
+    thread.start()
+
+# Render 실행
+if __name__ == '__main__':
+    start_monitoring()
+    app.run(host='0.0.0.0', port=10000)
