@@ -18,7 +18,7 @@ def get_all_swap_symbols():
     try:
         res = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers={"User-Agent": "Mozilla/5.0"})
         if res.status_code != 200: return []
-        return [d['instId'] for d in res.json().get('data', []) if d['settleCcy'] == 'USDT']
+        return [d['instId'] for d in res.json().get('data', [])]  # USDT 조건 제거
     except: return []
 
 def get_ohlcv(symbol, interval):
@@ -47,9 +47,9 @@ def check_conditions(symbol):
 def run_bot():
     symbols = get_all_swap_symbols()
     if not symbols:
-        send_telegram("⚠️ 감시할 USDT 종목이 없습니다.")
+        send_telegram("⚠️ 감시할 종목이 없습니다.")
         return
-    send_telegram(f"✅ OKX USDT 감시 시작 ({len(symbols)}종목)")
+    send_telegram(f"✅ OKX 선물 감시 시작됨 ({len(symbols)}종목)")
     while True:
         for s in symbols: check_conditions(s); time.sleep(0.3)
         time.sleep(60)
