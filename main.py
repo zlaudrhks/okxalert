@@ -1,28 +1,50 @@
-import requests, time, threading, pandas as pd, ta, os
+import requests
+import pandas as pd
+import time
+import ta
 from flask import Flask
+from threading import Thread
 
-TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw'
+# ✅ 텔레그램 설정
+TOKEN = 'ykyk123'
 CHAT_ID = '6786843744'
+
+# ✅ Flask 앱 설정 (Render 외부 점검용)
 app = Flask(__name__)
 
 @app.route('/')
-def home(): return '✅ OKX 급등 감지 봇 작동 중입니다!', 200
+def home():
+    return 'OKX 급등 감지 봇 작동 중!'
 
-def send_telegram(msg):
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
+
+# ✅ 텔레그램 메시지 전송 함수
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
     try:
-        res = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
-        print(f"📤 텔레그램 응답: {res.status_code}")
-        if res.status_code != 200: print("❌ 텔레그램 오류:", res.text)
-    except Exception as e: print("❌ 전송 실패:", e)
+        requests.post(url, data={'chat_id': CHAT_ID, 'text': message})
+    except Exception as e:
+        print("❌ 텔레그램 전송 오류:", e)
 
+# ✅ OKX 전체 선물 종목 리스트 가져오기 (프록시 적용)
 def get_all_swap_symbols():
     try:
         print("🔁 종목 목록 가져오는 중...")
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers=headers)
+        proxies = {
+            "http": "http://8.219.97.248:80",   # ← 필요시 다른 프록시 주소로 교체
+            "https": "http://8.219.97.248:80"
+        }
+        res = requests.get(
+            "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
+            headers=headers,
+            proxies=proxies,
+            timeout=10
+        )
         print(f"🔍 API 응답코드: {res.status_code}")
         if res.status_code != 200:
-            print("❌ API 오류:", res.text)
+            print("❌ 종목 조회 실패:", res.text)
             return []
         data = res.json().get('data', [])
         print(f"✅ 받은 종목 수: {len(data)}")
@@ -31,47 +53,53 @@ def get_all_swap_symbols():
         print("❌ 예외 발생 in get_all_swap_symbols:", e)
         return []
 
-def get_ohlcv(symbol, interval):
+# ✅ 급등 조건 검사 함수
+def check_condition(df):
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={interval}&limit=100"
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code != 200: return None
-        raw = res.json()['data']
-        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','vol','volCcy']).astype(float).iloc[::-1].reset_index(drop=True)
-        return df
+        df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        df['upper'] = ta.volatility.BollingerBands(df['close'], window=30).bollinger_hband()
+
+        one_min_change = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100
+        five_min_change = (df['close'].iloc[-1] - df['close'].iloc[-6]) / df['close'].iloc[-6] * 100
+        rsi = df['rsi'].iloc[-1]
+        bb_upper = df['upper'].iloc[-1]
+        price = df['close'].iloc[-1]
+
+        return one_min_change >= 1 and five_min_change >= 1.5 and rsi >= 70 and price > bb_upper
     except Exception as e:
-        print(f"❌ OHLCV 가져오기 실패 - {symbol}: {e}")
-        return None
+        print("❌ 조건 체크 중 오류:", e)
+        return False
 
-def check_conditions(symbol):
-    df = get_ohlcv(symbol, '5m')
-    if df is None or len(df) < 30: return
-    close = df['close']
-    rsi = ta.momentum.RSIIndicator(close=close, window=14).rsi().iloc[-1]
-    bb = ta.volatility.BollingerBands(close=close, window=30, window_dev=3)
-    upper = bb.bollinger_hband().iloc[-1]
-    change = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100
-    if change >= 1.5 and rsi > 70 and close.iloc[-1] > upper:
-        msg = f"📈 {symbol} 급등 (K=3)\n5분봉: +{change:.2f}%\nRSI: {rsi:.2f}\n종가: {close.iloc[-1]:.4f} > BB상단: {upper:.4f}"
-        send_telegram(msg)
-        print(msg)
-
-def run_bot():
-    print("🚀 급등 감지 봇 시작됨.")
+# ✅ 종목별로 캔들 데이터를 받아 조건 확인
+def check_symbols():
     symbols = get_all_swap_symbols()
     if not symbols:
-        print("⚠️ 가져온 종목이 없습니다.")
-        send_telegram("⚠️ 감시할 종목이 없습니다.")
+        send_telegram_message("⚠️ 감시할 종목이 없습니다.")
         return
-    print(f"🎯 감시할 종목 수: {len(symbols)}")
-    send_telegram(f"✅ OKX 선물 감시 시작됨 ({len(symbols)}종목)")
+
+    for symbol in symbols:
+        try:
+            url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1m&limit=30"
+            df = pd.DataFrame(requests.get(url).json()['data'])
+            df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'volCcy', 'volCcyQuote', 'confirm']
+            df = df.iloc[::-1].reset_index(drop=True)
+            df['close'] = df['close'].astype(float)
+
+            if len(df) >= 30 and check_condition(df):
+                message = f"🚨 급등 감지: {symbol}\n현재가: {df['close'].iloc[-1]}"
+                send_telegram_message(message)
+                print(message)
+        except Exception as e:
+            print(f"❌ {symbol} 분석 오류:", e)
+
+# ✅ 감시 루프
+def run_monitor():
+    send_telegram_message("🚀 급등 감지 봇 시작됨.")
     while True:
-        for s in symbols:
-            check_conditions(s)
-            time.sleep(0.3)
-        print("⏱️ 다음 감시 라운드 대기 중...")
+        check_symbols()
         time.sleep(60)
 
+# ✅ 실행
 if __name__ == '__main__':
-    threading.Thread(target=run_bot).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
+    Thread(target=run_flask).start()
+    run_monitor()
