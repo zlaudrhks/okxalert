@@ -7,7 +7,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-BOT_TOKEN = 'ykyk123'
+BOT_TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw'
 CHAT_ID = '6786843744'
 CHECK_INTERVAL = 60  # 1분마다 검사
 
@@ -18,7 +18,11 @@ proxies = {
 
 def send_telegram_message(message):
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': message}
+    data = {
+        'chat_id': CHAT_ID,
+        'text': message,
+        'parse_mode': 'MarkdownV2'
+    }
     try:
         res = requests.post(url, data=data)
         if res.status_code != 200:
@@ -57,6 +61,14 @@ def get_candles(symbol, bar="5m", limit=100):
         print(f"❌ {symbol} 캔들 오류: {e}")
         return None
 
+def escape_markdown(text: str) -> str:
+    """
+    MarkdownV2 전용 문자 이스케이프 함수
+    텔레그램에서 MarkdownV2를 쓸 때 특수문자 이스케이프가 필요함
+    """
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(['\\' + c if c in escape_chars else c for c in text])
+
 def check_conditions(symbol):
     df_5m = get_candles(symbol, "5m", 100)
     df_15m = get_candles(symbol, "15m", 100)
@@ -65,7 +77,7 @@ def check_conditions(symbol):
 
     now_price = df_5m["close"].iloc[-1]
 
-    # ✅ 조건 1: 5분봉
+    # 조건 1: 5분봉
     price_5m_ago = df_5m["close"].iloc[-6]
     change_5m = (now_price - price_5m_ago) / price_5m_ago * 100
 
@@ -76,16 +88,16 @@ def check_conditions(symbol):
     bb_upper_5m = df_5m["bb_upper"].iloc[-1]
 
     if change_5m > 1.5 and rsi_5m > 70 and now_price > bb_upper_5m:
-        message = (
-            f"⚠️ [강세 신호] {symbol}\n\n"
-            f"▷ 5분간 상승률: +{change_5m:.2f}%\n"
-            f"▷ RSI: {rsi_5m:.2f}"
+        msg = (
+            f"⚠️ [강세 신호] {escape_markdown(symbol)}\n\n"
+            f"▷ 5분간 상승률: `{change_5m:.2f}%`\n"
+            f"▷ RSI: `{rsi_5m:.2f}`"
         )
-        print(message)
-        send_telegram_message(message)
+        print(msg)
+        send_telegram_message(msg)
         return
 
-    # ✅ 조건 2: 15분봉
+    # 조건 2: 15분봉
     price_15m_ago = df_15m["close"].iloc[-6]
     change_15m = (now_price - price_15m_ago) / price_15m_ago * 100
 
@@ -96,13 +108,13 @@ def check_conditions(symbol):
     bb_upper_15m = df_15m["bb_upper"].iloc[-1]
 
     if rsi_15m > 70 and now_price > bb_upper_15m:
-        message = (
-            f"🚨 [급등 감지] {symbol}\n\n"
-            f"▶ 15분간 상승률: +{change_15m:.2f}%\n"
-            f"▶ RSI: {rsi_15m:.2f}"
+        msg = (
+            f"🚨 [급등 감지] {escape_markdown(symbol)}\n\n"
+            f"▶ 15분간 상승률: `{change_15m:.2f}%`\n"
+            f"▶ RSI: `{rsi_15m:.2f}`"
         )
-        print(message)
-        send_telegram_message(message)
+        print(msg)
+        send_telegram_message(msg)
     else:
         print(f"⏳ {symbol} 조건 불충족")
 
