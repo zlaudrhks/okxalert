@@ -16,10 +16,18 @@ def send_telegram(msg):
 
 def get_all_swap_symbols():
     try:
-        res = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code != 200: return []
-        return [d['instId'] for d in res.json().get('data', [])]  # USDT 조건 제거
-    except: return []
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers=headers)
+        print(f"🔍 API 응답코드: {res.status_code}")
+        if res.status_code != 200:
+            print("❌ API 오류:", res.text)
+            return []
+        data = res.json().get('data', [])
+        print(f"✅ 받은 종목 수: {len(data)}")
+        return [d['instId'] for d in data]
+    except Exception as e:
+        print("❌ 예외 발생:", e)
+        return []
 
 def get_ohlcv(symbol, interval):
     try:
