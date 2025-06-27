@@ -34,8 +34,9 @@ def get_all_swap_symbols():
     url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
     try:
         res = requests.get(url)
-        print("📡 심볼 응답코드:", res.status_code)
+        print("📡 OKX 심볼 응답코드:", res.status_code)  # ✅ 응답코드 출력 추가
         if res.status_code != 200:
+            print("❌ 심볼 응답 실패, 빈 목록 반환")
             return []
         data = res.json().get('data', [])
         symbols = [item['instId'] for item in data if item['settleCcy'] == 'USDT']
