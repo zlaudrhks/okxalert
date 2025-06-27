@@ -1,140 +1,79 @@
-import requests
-import pandas as pd
-from ta.volatility import BollingerBands
-from ta.momentum import RSIIndicator
-from flask import Flask
-import time
-from datetime import datetime
+import requests import pandas as pd import time import datetime from ta.volatility import BollingerBands from ta.momentum import RSIIndicator from flask import Flask
 
-# 텔레그램 설정
-BOT_TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw'
-CHAT_ID = '6786843744'
+텔레그램 설정
 
-app = Flask(__name__)
+TELEGRAM_TOKEN = '7971519272:AAHjBO9Dnc2e-cc5uqQbalHy3bi0kPSAfNw' CHAT_ID = '6786843744'
 
-def send_telegram_message(message):
-    url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-    try:
-        response = requests.post(url, data={'chat_id': CHAT_ID, 'text': message})
-        if response.status_code != 200:
-            print(f"❌ 텔레그램 전송 실패: {response.text}")
-    except Exception as e:
-        print(f"❌ 텔레그램 예외 발생: {e}")
+def send_telegram_message(message): url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"} try: response = requests.post(url, data=data) if response.status_code != 200: print("❌ 텔레그램 전송 실패:", response.text) except Exception as e: print("❌ 텔레그램 예외:", e)
 
-# USDT-SWAP 종목 가져오기
-def get_usdt_swap_symbols():
-    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-    try:
-        response = requests.get(url, timeout=10)
-        print("📦 OKX API 응답 상태 코드:", response.status_code)
-        print("📦 응답 본문 일부:", response.text[:300])
+OKX 프록시 서버 주소
 
-        response.raise_for_status()
-        data = response.json()
+BASE_URL = 'https://okxrelay.onrender.com/okx'
 
-        if data.get("code") != "0":
-            print("❌ OKX API 에러 코드:", data.get("code"))
-            return []
+종목 리스트 가져오기 (USDT 무기한 선물만)
 
-        symbols = [item['instId'] for item in data['data'] if item['instId'].endswith("USDT-SWAP")]
-        print(f"✅ 받은 USDT 종목 수: {len(symbols)}")
-        return symbols
+def get_usdt_swaps(): try: url = f"{BASE_URL}/public/instruments?instType=SWAP" response = requests.get(url, timeout=10) if response.status_code != 200: print(f"📦 OKX API 응답 상태 코드: {response.status_code}") print("📦 응답 본문 일부:", response.text[:300]) return [] data = response.json() return [x['instId'] for x in data['data'] if x['ctValCcy'] == 'USDT'] except Exception as e: print("❌ 종목 목록 가져오기 오류:", e) return []
 
-    except Exception as e:
-        print(f"❌ 종목 목록 가져오기 오류: {e}")
-        return []
+캔들 데이터 가져오기 (proxy 통해)
 
-# 캔들 데이터 가져오기
-def get_candles(symbol, bar):
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit=30"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+def get_candles(symbol, bar): try: url = f"{BASE_URL}/market/candles?instId={symbol}&bar={bar}&limit=100" response = requests.get(url, timeout=10) if response.status_code != 200: return None data = response.json()['data'] df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume", "volumeCcy"]) df = df.iloc[::-1].copy() df['close'] = df['close'].astype(float) return df except: return None
 
-        if data.get("code") != "0":
-            raise Exception(f"API 오류: {data.get('msg')}")
+급등/급락 조건 검사
 
-        df = pd.DataFrame(data['data'], columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'volumeCcy', 'volumeCcyQuote', 'confirm'
-        ])
-        df = df.astype({
-            'open': 'float', 'high': 'float', 'low': 'float',
-            'close': 'float', 'volume': 'float'
-        })
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.sort_values('timestamp', inplace=True)
-        return df.reset_index(drop=True)
-    except Exception as e:
-        print(f"{symbol} 캔들 오류: {e}")
-        return None
+def analyze_symbol(symbol): try: result = []
 
-def analyze_symbol(symbol):
-    result = []
+# 5분봉 (급등/급락)
+    df5 = get_candles(symbol, '5m')
+    if df5 is not None and len(df5) > 30:
+        df5['rsi'] = RSIIndicator(df5['close'], window=14).rsi()
+        bb5 = BollingerBands(df5['close'], window=20, window_dev=3)
+        df5['bb_upper'] = bb5.bollinger_hband()
+        df5['bb_lower'] = bb5.bollinger_lband()
+        c0, c1 = df5['close'].iloc[-1], df5['close'].iloc[-2]
+        pct_change_5m = (c0 - c1) / c1 * 100
 
-    df_5 = get_candles(symbol, '5m')
-    df_15 = get_candles(symbol, '15m')
-    if df_5 is None or df_15 is None:
-        return result
+        if pct_change_5m >= 1.5 and df5['rsi'].iloc[-1] > 70 and c0 > df5['bb_upper'].iloc[-1]:
+            result.append("🚀 5분봉 급등 조건 충족")
+        if pct_change_5m <= -1.5 and df5['rsi'].iloc[-1] < 30 and c0 < df5['bb_lower'].iloc[-1]:
+            result.append("⚠️ 5분봉 급락 조건 충족")
 
-    # ===== 5분봉 급등 조건 =====
-    close_now = df_5['close'].iloc[-1]
-    close_prev = df_5['close'].iloc[-2]
-    change_5m = (close_now - close_prev) / close_prev * 100
+    # 15분봉 (급등/급락)
+    df15 = get_candles(symbol, '15m')
+    if df15 is not None and len(df15) > 30:
+        df15['rsi'] = RSIIndicator(df15['close'], window=14).rsi()
+        bb15 = BollingerBands(df15['close'], window=20, window_dev=3)
+        df15['bb_lower'] = bb15.bollinger_lband()
+        df15['bb_upper'] = bb15.bollinger_hband()
+        c15 = df15['close'].iloc[-1]
 
-    rsi_5 = RSIIndicator(df_5['close'], window=14).rsi().iloc[-1]
-    bb_5 = BollingerBands(close=df_5['close'], window=20, window_dev=3)
-    bb_upper_5 = bb_5.bollinger_hband().iloc[-1]
-
-    if (
-        change_5m >= 1.5 and
-        rsi_5 > 70 and
-        close_now > bb_upper_5
-    ):
-        result.append(f"🚀 [{symbol}] 5분봉 기준 급등!\n📈 등락률: {change_5m:.2f}%\n📊 RSI: {rsi_5:.2f}")
-
-    # ===== 5분봉 급락 조건 =====
-    if (
-        change_5m <= -1.5 and
-        rsi_5 < 30 and
-        close_now < bb_5.bollinger_lband().iloc[-1]
-    ):
-        result.append(f"📉 [{symbol}] 5분봉 기준 급락!\n📉 등락률: {change_5m:.2f}%\n📊 RSI: {rsi_5:.2f}")
-
-    # ===== 15분봉 급등 조건 =====
-    rsi_15 = RSIIndicator(df_15['close'], window=14).rsi().iloc[-1]
-    bb_15 = BollingerBands(close=df_15['close'], window=20, window_dev=3)
-    close_15 = df_15['close'].iloc[-1]
-    if (
-        rsi_15 > 70 and
-        close_15 > bb_15.bollinger_hband().iloc[-1]
-    ):
-        result.append(f"🚀 [{symbol}] 15분봉 RSI+BB 상단 돌파 급등!\n📊 RSI: {rsi_15:.2f}")
-
-    # ===== 15분봉 급락 조건 =====
-    if (
-        rsi_15 < 30 and
-        close_15 < bb_15.bollinger_lband().iloc[-1]
-    ):
-        result.append(f"📉 [{symbol}] 15분봉 RSI+BB 하단 돌파 급락!\n📊 RSI: {rsi_15:.2f}")
+        if df15['rsi'].iloc[-1] > 70 and c15 > df15['bb_upper'].iloc[-1]:
+            result.append("🚀 15분봉 RSI+BB 상단 급등 조건 충족")
+        if df15['rsi'].iloc[-1] < 30 and c15 < df15['bb_lower'].iloc[-1]:
+            result.append("⚠️ 15분봉 RSI+BB 하단 급락 조건 충족")
 
     return result
 
-@app.route('/')
-def home():
-    return f'✅ OKX 급등 감지 봇 작동 중! ({datetime.utcnow()})'
+except Exception as e:
+    print(f"❌ {symbol} 분석 오류:", e)
+    return []
 
-def main():
-    symbols = get_usdt_swap_symbols()
-    send_telegram_message(f"✅ OKX 급등 감지 봇 작동 시작됨\n총 감시 종목 수: {len(symbols)}개")
+메인 실행 함수
 
-    for symbol in symbols:
-        messages = analyze_symbol(symbol)
-        for msg in messages:
-            send_telegram_message(msg)
-        time.sleep(0.2)
+def run_bot(): symbols = get_usdt_swaps() send_telegram_message(f"✅ OKX 급등 감지 봇 작동 시작됨\n총 감시 종목 수: **{len(symbols)}**개")
 
-if __name__ == '__main__':
-    main()
-    app.run(host='0.0.0.0', port=10000)
+for symbol in symbols:
+    conditions = analyze_symbol(symbol)
+    if conditions:
+        message = f"📊 *{symbol}* 감지됨\n" + "\n".join(conditions)
+        print(message)
+        send_telegram_message(message)
+    time.sleep(0.3)
+
+Flask 헬스체크 서버
+
+app = Flask(name)
+
+@app.route("/") def index(): return f'✅ OKX 급등 감지 봇 작동 중! ({datetime.datetime.utcnow()})'
+
+if name == 'main': run_bot() app.run(host='0.0.0.0', port=10000)
+
