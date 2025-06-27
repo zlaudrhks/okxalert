@@ -1,4 +1,3 @@
-requests
 flask
-pandas
-ta
+requests
+flask-cors
