@@ -2,3 +2,5 @@ flask
 pandas
 ta
 requests
+websocket-client
+psycopg2-binary
