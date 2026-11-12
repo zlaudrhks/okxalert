@@ -284,6 +284,8 @@ def on_open(ws):
         f"{state.CONTROL_SERVER_URL}/symbols/{state.APP_ID}", timeout=10
     ).json()
     state.symbols_cache[:] = res
+    if state.BTC_SYMBOL not in state.symbols_cache:
+        state.symbols_cache.insert(0, state.BTC_SYMBOL)
 
     batch = 80
     for i in range(0, len(state.symbols_cache), batch):
@@ -365,16 +367,20 @@ def fetch_control_commands():
                 learned_str = "\n".join(learned_lines) if learned_lines else "  없음(동적계산)"
 
                 send_telegram(
-                    f"📊 FastBand 상태 (APP {state.APP_ID})\n\n"
+                    f"📊 FastBand v{getattr(state, 'APP_VERSION', '2.0.0')} 상태 (APP {state.APP_ID})\n\n"
                     f"🟢 거래상태\n"
                     f"거래활성화 : {'ON' if state.trading_enabled else 'OFF'}\n"
                     f"활성포지션 : {pos_count}개\n"
                     f"누적PnL : {state.total_pnl_usdt:.2f} USDT\n\n"
-                    f"💰 진입설정\n"
+                    f"💰 진입 및 익절/손절 (v2)\n"
                     f"사이즈 : {state.usdt_amount} USDT\n"
-                    f"TP : {state.TP_PCT*100:.2f}% | SL : {state.SL_PCT*100:.2f}%\n"
-                    f"진입대기 : {state.ENTRY_DELAY_SEC}초\n\n"
-                    f"📈 필터\n"
+                    f"기본TP/SL : {state.TP_PCT*100:.2f}% | {state.SL_PCT*100:.2f}%\n"
+                    f"ATR 동적 TP/SL : {'ON' if state.ATR_DYNAMIC_ENABLED else 'OFF'} (TP {state.ATR_TP_MULT}x / SL {state.ATR_SL_MULT}x)\n"
+                    f"1차 분할익절 : {'ON' if state.PARTIAL_TP_ENABLED else 'OFF'} (수량 {int(state.PARTIAL_TP_RATIO*100)}% / 목표 {state.PARTIAL_TP_PCT*100:.1f}%)\n"
+                    f"본절 스탑(BEP) : {'ON' if state.BEP_STOP_ENABLED else 'OFF'} (+{state.BEP_BUFFER_PCT*100:.2f}%)\n"
+                    f"트레일링 익절 : {'ON' if state.TRAIL_ENABLED else 'OFF'} (발동 {state.TRAIL_ACTIVATE_PCT}% / 감시 {state.TRAIL_DISTANCE_PCT}%)\n\n"
+                    f"🛡️ 안전 필터 (v2)\n"
+                    f"BTC 서킷브레이커 : {'ON' if state.BTC_CIRCUIT_ENABLED else 'OFF'} (±{state.BTC_5M_SURGE_PCT}% / {state.BTC_COOLDOWN_SEC}초)\n"
                     f"ADX : {'ON' if state.adx_filter_enabled else 'OFF'} ({state.ADX_THRESHOLD}) | "
                     f"거래량소진 : {'ON' if state.vol_exhausted_filter_enabled else 'OFF'}\n"
                     f"RSI : {'ON' if state.RSI_FILTER_ENABLED else 'OFF'} "
@@ -444,6 +450,34 @@ def fetch_control_commands():
             elif c == "vol꺼":
                 state.vol_exhausted_filter_enabled = False
                 send_telegram(f"🔓 거래량 소진 필터 비활성화 (APP {state.APP_ID})")
+
+            elif c == "btc서킷켜":
+                state.BTC_CIRCUIT_ENABLED = True
+                send_telegram(f"✅ BTC 서킷 브레이커 활성화 (APP {state.APP_ID})")
+            elif c == "btc서킷꺼":
+                state.BTC_CIRCUIT_ENABLED = False
+                send_telegram(f"🔓 BTC 서킷 브레이커 비활성화 (APP {state.APP_ID})")
+
+            elif c == "atr켜":
+                state.ATR_DYNAMIC_ENABLED = True
+                send_telegram(f"✅ ATR 동적 TP/SL 활성화 (APP {state.APP_ID})")
+            elif c == "atr꺼":
+                state.ATR_DYNAMIC_ENABLED = False
+                send_telegram(f"🔓 ATR 동적 TP/SL 비활성화 (고정 TP/SL 모드)")
+
+            elif c == "분할익절켜":
+                state.PARTIAL_TP_ENABLED = True
+                send_telegram(f"✅ 1차 분할 익절(50%) 활성화 (APP {state.APP_ID})")
+            elif c == "분할익절꺼":
+                state.PARTIAL_TP_ENABLED = False
+                send_telegram(f"🔓 1차 분할 익절 비활성화 (APP {state.APP_ID})")
+
+            elif c == "트레일켜":
+                state.TRAIL_ENABLED = True
+                send_telegram(f"✅ 트레일링 익절 활성화 (APP {state.APP_ID})")
+            elif c == "트레일꺼":
+                state.TRAIL_ENABLED = False
+                send_telegram(f"🔓 트레일링 익절 비활성화 (APP {state.APP_ID})")
 
             elif c == "rsi켜":
                 state.RSI_FILTER_ENABLED = True
