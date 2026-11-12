@@ -12,6 +12,7 @@ from okx_api import (
     check_order_status, get_filled_info,
     close_position_oco_checked,
     wait_position_visible,
+    adjust_size, place_market_order, cancel_algo_order,
 )
 from indicators import (
     get_bollinger, get_volume_ratio, get_adx, get_rsi,
@@ -20,6 +21,147 @@ from indicators import (
 )
 from exit import force_market_close_safe, _close_with_fallback
 from trade_log import _upsert_trade_log
+
+# =====================================================
+# [v2.0.0 전략 개선 모듈] ATR / BTC 서킷브레이커 / 분할익절
+# =====================================================
+
+def calc_atr_pct(symbol, period=14):
+    """
+    최근 N개 5분봉 캔들의 고가/저가/종가를 바탕으로 ATR을 산출하고,
+    현재가 대비 ATR 비율(%)을 반환합니다.
+    """
+    try:
+        highs = list(state.closed_highs.get(symbol, []))
+        lows = list(state.closed_lows.get(symbol, []))
+        closes = list(state.closed_closes.get(symbol, []))
+
+        if len(closes) < period + 1 or len(highs) < period + 1 or len(lows) < period + 1:
+            return None
+
+        tr_list = []
+        sub_h = highs[-period:]
+        sub_l = lows[-period:]
+        sub_c_prev = closes[-period-1:-1]
+
+        for h, l, c_prev in zip(sub_h, sub_l, sub_c_prev):
+            tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+            tr_list.append(tr)
+
+        if not tr_list:
+            return None
+
+        atr = sum(tr_list) / len(tr_list)
+        curr_px = closes[-1] if closes else 1.0
+        if curr_px <= 0:
+            return None
+        return (atr / curr_px) * 100
+    except Exception as e:
+        print(f"[calc_atr_pct] {symbol} 예외: {e}")
+        return None
+
+def _is_btc_circuit_breaker_active():
+    """
+    BTC 5분봉 등락률 또는 변동폭이 임계치(±1.0%)를 초과할 경우
+    알트코인의 신규 역추세 진입을 차단하는 시장 서킷 브레이커입니다.
+    """
+    if not getattr(state, "BTC_CIRCUIT_ENABLED", True):
+        return False
+
+    now = time.time()
+    if now - state.last_btc_circuit_time < state.BTC_COOLDOWN_SEC:
+        return True
+
+    btc_bar = state.bar_state.get(state.BTC_SYMBOL)
+    if not btc_bar or not btc_bar.get("o") or not btc_bar.get("c"):
+        return False
+
+    btc_open = btc_bar["o"]
+    btc_close = btc_bar["c"]
+    if btc_open <= 0:
+        return False
+
+    btc_chg_pct = abs((btc_close - btc_open) / btc_open) * 100
+    btc_high = btc_bar.get("h", btc_close)
+    btc_low = btc_bar.get("l", btc_close)
+    btc_range_pct = ((btc_high - btc_low) / btc_open) * 100
+
+    if btc_chg_pct >= state.BTC_5M_SURGE_PCT or btc_range_pct >= (state.BTC_5M_SURGE_PCT * 1.3):
+        state.last_btc_circuit_time = now
+        send_telegram(
+            f"⚡ [BTC 서킷 브레이커 발동]\n"
+            f"비트코인 5분 등락: {btc_chg_pct:.2f}% (진폭: {btc_range_pct:.2f}%)\n"
+            f"기준({state.BTC_5M_SURGE_PCT}%) 초과로 {state.BTC_COOLDOWN_SEC}초간 모든 알트코인 신규 진입을 정지합니다."
+        )
+        return True
+
+    return False
+
+def _execute_partial_tp_and_bep(symbol, pos, current_price):
+    """
+    1차 목표가 도달 시 50% 분할 익절을 시장가로 체결하고,
+    남은 50%의 스탑로스를 본절가(BEP)로 이동시키며 트레일링 익절을 시작합니다.
+    """
+    try:
+        side = pos["side"]
+        entry = pos["entry"]
+        total_sz = pos["sz"]
+        old_oco_id = pos.get("oco_id")
+
+        meta = state.instrument_meta.get(symbol, {"lotSz": 1, "minSz": 1})
+        lot_sz = float(meta.get("lotSz", 1))
+        min_sz = float(meta.get("minSz", 1))
+
+        close_sz = adjust_size(total_sz * state.PARTIAL_TP_RATIO, lot_sz, min_sz)
+        remain_sz = adjust_size(total_sz - close_sz, lot_sz, min_sz)
+
+        if close_sz <= 0 or remain_sz < min_sz:
+            print(f"[_execute_partial_tp_and_bep] {symbol} 수량 분할 불가 (총: {total_sz}, 50%: {close_sz}, 잔여: {remain_sz})")
+            return
+
+        close_side = "sell" if side == "buy" else "buy"
+
+        # 1. 기존 OCO 취소
+        if old_oco_id:
+            cancel_algo_order(symbol, old_oco_id)
+            time.sleep(0.2)
+
+        # 2. 50% 시장가 분할 익절
+        ord_id = place_market_order(symbol, close_side, close_sz, reduce_only=True)
+        if not ord_id:
+            send_telegram(f"⚠️ {symbol} 1차 분할 익절 시장가 주문 실패")
+            return
+
+        # 3. 본절 스탑(BEP) 및 2차 연장 TP 계산
+        tp_pct = pos.get("tp_pct", state.TP_PCT)
+        tp2_pct = tp_pct * state.TP2_EXTEND_MULT
+
+        if side == "buy":
+            bep_sl = round_to_tick(symbol, entry * (1 + state.BEP_BUFFER_PCT))
+            tp2 = round_to_tick(symbol, entry * (1 + tp2_pct))
+        else:
+            bep_sl = round_to_tick(symbol, entry * (1 - state.BEP_BUFFER_PCT))
+            tp2 = round_to_tick(symbol, entry * (1 - tp2_pct))
+
+        # 4. 잔여 50%에 대한 신규 OCO 설정 (TP2 / 본절 SL)
+        new_oco_id = close_position_oco_checked(symbol, close_side, remain_sz, tp2, bep_sl)
+
+        with state.lock:
+            pos["sz"] = remain_sz
+            pos["oco_id"] = new_oco_id
+            pos["bep_sl"] = bep_sl
+            pos["partial_tp_done"] = True
+
+        pnl_pct = (current_price - entry) / entry * 100 if side == "buy" else (entry - current_price) / entry * 100
+        send_telegram(
+            f"🎯 1차 분할 익절 완료 (50%) - {symbol}\n"
+            f"익절수량: {close_sz} | 잔여수량: {remain_sz}\n"
+            f"실현 PnL: +{pnl_pct:.2f}%\n"
+            f"스탑로스: 본절가({bep_sl}) 상향 이동\n"
+            f"2차 TP: {tp2} (+{tp2_pct*100:.2f}%) & 트레일링 익절 가동"
+        )
+    except Exception as e:
+        print(f"[_execute_partial_tp_and_bep] {symbol} 오류: {e}")
 
 def _risk_guard():
     if state.risk_guard_triggered:
@@ -565,18 +707,37 @@ def _delayed_confirm_and_enter(
             send_telegram(f"⚠️ 포지션 인식 실패 → OCO 중단\n{symbol}")
             return
 
+        # ✅ [v2 개선 4] ATR 기반 동적 TP/SL 계산
+        tp_pct = state.TP_PCT
+        sl_pct = state.SL_PCT
+        atr_applied = False
+        if getattr(state, "ATR_DYNAMIC_ENABLED", False):
+            atr_val = calc_atr_pct(symbol, period=state.ATR_PERIOD)
+            if atr_val is not None and atr_val > 0:
+                atr_ratio = atr_val / 100.0
+                tp_pct = max(state.ATR_MIN_TP_PCT, min(state.ATR_MAX_TP_PCT, atr_ratio * state.ATR_TP_MULT))
+                sl_pct = max(state.ATR_MIN_SL_PCT, min(state.ATR_MAX_SL_PCT, atr_ratio * state.ATR_SL_MULT))
+                atr_applied = True
+
+        with state.lock:
+            m = state.positions.get(symbol, {}).get("main")
+            if m:
+                m["tp_pct"] = tp_pct
+                m["sl_pct"] = sl_pct
+
         for retry in range(3):
             relax = 1 + 0.25 * retry
             if initial_side == "buy":
-                tp = round_to_tick(symbol, entry * (1 + state.TP_PCT * relax))
-                sl = round_to_tick(symbol, entry * (1 - state.SL_PCT * relax))
+                tp = round_to_tick(symbol, entry * (1 + tp_pct * relax))
+                sl = round_to_tick(symbol, entry * (1 - sl_pct * relax))
             else:
-                tp = round_to_tick(symbol, entry * (1 - state.TP_PCT * relax))
-                sl = round_to_tick(symbol, entry * (1 + state.SL_PCT * relax))
+                tp = round_to_tick(symbol, entry * (1 - tp_pct * relax))
+                sl = round_to_tick(symbol, entry * (1 + sl_pct * relax))
 
             oco_id = close_position_oco_checked(symbol, close_side, pos_sz, tp, sl)
             if oco_id:
-                send_telegram(f"🟢 OCO 설정 성공 ({retry+1}/3)\n{symbol}")
+                atr_msg = f" (ATR동적: TP {tp_pct*100:.2f}% / SL {sl_pct*100:.2f}%)" if atr_applied else ""
+                send_telegram(f"🟢 OCO 설정 성공 ({retry+1}/3)\n{symbol}{atr_msg}")
                 break
 
         if not oco_id:
@@ -640,12 +801,24 @@ def try_enter_on_price(symbol, price):
         elapsed_min = (time.time() - pos["entry_time"]) / 60
         max_pct     = pos.get("max_profit_pct", 0)
 
+        # ✅ [v2 개선 1] 1차 분할 익절(50%) 및 본절 스탑(BEP) 이동 트리거
+        tp1_trigger = pos.get("tp_pct", state.PARTIAL_TP_PCT) * 100 if state.ATR_DYNAMIC_ENABLED else state.PARTIAL_TP_PCT * 100
+        if state.PARTIAL_TP_ENABLED and not pos.get("partial_tp_done") and pnl_pct >= tp1_trigger:
+            with state.lock:
+                pos["partial_tp_done"] = True
+            Thread(
+                target=_execute_partial_tp_and_bep,
+                args=(symbol, pos, price),
+                daemon=True,
+            ).start()
+
         if state.TRAIL_ENABLED and max_pct >= state.TRAIL_ACTIVATE_PCT:
             if max_pct - pnl_pct >= state.TRAIL_DISTANCE_PCT:
                 with state.lock:
                     cur = state.positions.get(symbol, {}).get("main")
                     if cur and cur.get("alive") and cur.get("exit_intent") is None:
                         cur["exit_intent"] = "TRAILING_STOP"
+                send_telegram(f"🏹 트레일링 익절 발동 - {symbol}\n최고수익: {max_pct:.2f}% | 청산수익: {pnl_pct:.2f}%")
                 force_market_close_safe(symbol)
                 return
 
@@ -664,6 +837,11 @@ def try_enter_on_price(symbol, price):
                         cur["exit_intent"] = "NO_PROFIT_5M"
                 force_market_close_safe(symbol)
                 return
+
+    # ✅ [v2 개선 2] BTC 서킷 브레이커 (비트코인 급변동 시 알트코인 신규 진입 차단)
+    if state.BTC_CIRCUIT_ENABLED and symbol != state.BTC_SYMBOL:
+        if _is_btc_circuit_breaker_active():
+            return
 
     if state.last_failed_order_time.get(symbol):
         failed_time = state.last_failed_order_time[symbol]
