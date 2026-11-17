@@ -46,6 +46,8 @@ VALID_CMDS = {
     "slip켜", "slip꺼", "slip비율",
     "손실한도",
     "이격mid5m", "이격mid10m", "이격deep5m", "이격deep10m",
+    "btc서킷켜", "btc서킷꺼", "atr켜", "atr꺼",
+    "분할익절켜", "분할익절꺼", "트레일켜", "트레일꺼",
 }
 
 VALUE_CMDS = {

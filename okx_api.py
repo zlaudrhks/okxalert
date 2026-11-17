@@ -350,3 +350,27 @@ def close_position_oco_checked(symbol, side, pos_sz, tp_price, sl_price):
     except Exception as e:
         print(f"[close_position_oco_checked] ERROR: {e}")
         return None
+
+def place_market_order(symbol, side, sz, reduce_only=True):
+    """
+    시장가 주문을 실행합니다 (분할 익절, 긴급 청산 등 사용).
+    """
+    if not state.trading_enabled:
+        return None
+    try:
+        body = {
+            "instId":     symbol,
+            "tdMode":     "isolated",
+            "side":       side,
+            "ordType":    "market",
+            "sz":         str(sz),
+            "reduceOnly": reduce_only,
+        }
+        res = okx_request("POST", "/api/v5/trade/order", json.dumps(body, separators=(",", ":")))
+        if res and res.get("code") == "0":
+            return res["data"][0].get("ordId")
+        print(f"[place_market_order] 실패 - {symbol}: {res}")
+        return None
+    except Exception as e:
+        print(f"[place_market_order] 예외 - {symbol}: {e}")
+        return None
