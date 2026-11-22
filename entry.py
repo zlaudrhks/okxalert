@@ -266,6 +266,284 @@ def _track_blocked_vol_outcome(symbol, signal_id, initial_side, target_price, du
             "blocked_vol_closest_dist_pct": round(closest_dist_pct, 4) if closest_dist_pct is not None else None,
         })
 
+# =====================================================
+# [v3.0.0] 3버전 비교용 그림자(Shadow) 로깅
+#  - 주문/포지션/텔레그램에 일절 접촉하지 않는 관찰 전용 daemon 스레드
+#  - A: 현재 실제 매매(기존 로직이 그대로 기록) + 신호 후 10분 관찰 보조 필드
+#  - B: 신호 후 5~15초 '거래량 소진 + 0.2% 꺾임' 확인 시 가상 진입
+#       → TP +1.2% / SL -1.5% 단일 OCO 먼저 도달 여부
+#  - C: B와 같은 가상 진입가에서 +1.0% 50% 분할익절
+#       → 잔여 50% 본절(+0.1%) 스탑 이동 + 트레일링(최고 +1.2% 후 -0.4% 되돌림)
+# =====================================================
+SHADOW_OBS_SEC       = 15.0    # 신호 후 관찰 구간 (5~15초 판정, 15초에 진입 포기)
+SHADOW_EARLY_SEC     = 5.0     # 전반 5초
+SHADOW_LATE_SEC      = 10.0    # 전반 5초 vs 후반 5초 판정 시점
+SHADOW_MIN_TICKS     = 4       # 이보다 틱이 적으면 판정 불가 (통과시키지 않음)
+SHADOW_VOL_THRESHOLD = 0.4     # late/early < 0.4 → 거래량 소진
+SHADOW_HOOK_PCT      = 0.002   # 직전 고/저점 대비 0.2% 되돌림(꺾임)
+SHADOW_TRACK_SEC     = 600.0   # 가상 진입 후 최대 추적 10분
+SHADOW_5M_SEC        = 300.0   # 5분 시점 기록
+SHADOW_B_TP_PCT      = 1.2     # 버전 B 목표
+SHADOW_B_SL_PCT      = -1.5    # 버전 B / C 손절
+SHADOW_C_TP1_PCT     = 1.0     # 버전 C 1차 분할익절
+SHADOW_C_BEP_PCT     = 0.1     # 버전 C 본절 스탑 버퍼
+SHADOW_C_TRAIL_ACT   = 1.2     # 버전 C 트레일링 가동 최고 수익
+SHADOW_C_TRAIL_DIST  = 0.4     # 버전 C 트레일링 되돌림
+SHADOW_C_PARTIAL_R   = 0.5     # 버전 C 분할 비율
+
+
+def _shadow_pnl_pct(side, entry, px):
+    if not entry or not px:
+        return None
+    if side == "buy":
+        return (px - entry) / entry * 100
+    return (entry - px) / entry * 100
+
+
+def _track_shadow_versions(symbol, signal_id, side, signal_price, entry_target):
+    """
+    실제 매매와 완전히 분리된 가상 추적. state.recent_prices / state.recent_tick_volumes 만 읽고
+    결과는 _upsert_trade_log(record_id = signal_id) 의 shadow_* 필드로만 남긴다.
+    """
+    t_start  = time.time()
+    ref_sec  = int(t_start)
+    obs_end  = t_start + SHADOW_OBS_SEC
+    vol_by_sec = {}
+    tick_by_sec = {}
+    low_px = None
+    high_px = None
+
+    entered      = False
+    entry_px     = None
+    wait_sec     = None
+    t_entry      = None
+    entry_reason = None
+    vol_ratio    = None
+    vol_early    = None
+    vol_late     = None
+    vol_ticks    = 0
+    hook_now     = None
+
+    b_closed, b_exit, b_exit_sec, b_pnl = False, None, None, None
+    b_5m_checked, b_5m_pnl = False, None
+    c_closed, c_partial, c_max = False, False, None
+    c_exit, c_exit_sec, c_pnl = None, None, None
+
+    def _upsert(payload):
+        try:
+            _upsert_trade_log(signal_id, payload)
+        except Exception as ex:
+            print(f"[_track_shadow_versions] {symbol} 로그 전송 예외: {ex}")
+
+    def _observe_tick_volume():
+        # 초 단위로 관측된 최대 합/최대 틱수를 보존 (디큐에서 밀려난 초도 유지)
+        per_vol, per_cnt = {}, {}
+        for t_sec, v in list(state.recent_tick_volumes.get(symbol, [])):
+            if ref_sec <= t_sec < ref_sec + int(SHADOW_LATE_SEC):
+                per_vol[t_sec] = per_vol.get(t_sec, 0.0) + float(v or 0)
+                per_cnt[t_sec] = per_cnt.get(t_sec, 0) + 1
+        for t_sec, v in per_vol.items():
+            if v > vol_by_sec.get(t_sec, 0.0):
+                vol_by_sec[t_sec] = v
+        for t_sec, n in per_cnt.items():
+            if n > tick_by_sec.get(t_sec, 0):
+                tick_by_sec[t_sec] = n
+
+    try:
+        # ── 1단계: 신호 후 5~15초 관찰 ──
+        while True:
+            now     = time.time()
+            elapsed = now - t_start
+            prices  = state.recent_prices.get(symbol)
+            px      = prices[-1] if prices else None
+            if px is not None:
+                low_px  = px if low_px  is None else min(low_px,  px)
+                high_px = px if high_px is None else max(high_px, px)
+
+            _observe_tick_volume()
+
+            if elapsed >= SHADOW_LATE_SEC:
+                split     = ref_sec + int(SHADOW_EARLY_SEC)
+                vol_early = sum(v for t, v in vol_by_sec.items() if t < split)
+                vol_late  = sum(v for t, v in vol_by_sec.items() if t >= split)
+                vol_ticks = int(sum(tick_by_sec.values()))
+                if vol_early > 0 and vol_ticks >= SHADOW_MIN_TICKS:
+                    vol_ratio = round(vol_late / vol_early, 4)
+
+                exhausted = (vol_ratio is not None and vol_ratio < SHADOW_VOL_THRESHOLD)
+
+                hook = False
+                if px is not None and low_px and high_px:
+                    if side == "buy":
+                        hook_now = round((px - low_px) / low_px * 100, 3)
+                        hook     = px >= low_px * (1 + SHADOW_HOOK_PCT)
+                    else:
+                        hook_now = round((high_px - px) / high_px * 100, 3)
+                        hook     = px <= high_px * (1 - SHADOW_HOOK_PCT)
+
+                if exhausted and hook and px is not None and now <= obs_end:
+                    entered      = True
+                    entry_px     = px
+                    wait_sec     = round(elapsed, 2)
+                    t_entry      = now
+                    entry_reason = "VOL_EXHAUSTED+HOOK"
+                    break
+
+            if elapsed >= SHADOW_OBS_SEC:
+                break
+
+            time.sleep(0.25)
+
+        obs_fields = {
+            "shadow_entered":       entered,
+            "shadow_entry_reason":  entry_reason,
+            "shadow_wait_sec":      wait_sec,
+            "shadow_entry_price":   entry_px,
+            "shadow_vol_ratio":     vol_ratio,
+            "shadow_vol_early":     round(vol_early, 2) if vol_early is not None else None,
+            "shadow_vol_late":      round(vol_late, 2) if vol_late is not None else None,
+            "shadow_vol_ticks":     vol_ticks,
+            "shadow_vol_threshold": SHADOW_VOL_THRESHOLD,
+            "shadow_hook_pct":      hook_now,
+            "shadow_hook_threshold": SHADOW_HOOK_PCT * 100,
+            "shadow_ts_entry":      t_entry,
+        }
+
+        if not entered:
+            if vol_ticks < SHADOW_MIN_TICKS:
+                entry_reason = "NO_TICK_DATA"
+            elif vol_ratio is None or vol_ratio >= SHADOW_VOL_THRESHOLD:
+                entry_reason = "VOL_NOT_EXHAUSTED"
+            else:
+                entry_reason = "NO_HOOK"
+            obs_fields["shadow_entry_reason"] = entry_reason
+            _upsert(obs_fields)
+        else:
+            _upsert(obs_fields)
+
+        # ── 2단계: 가상 진입 후 최대 10분 추적 (B / C) ──
+        while True:
+            now = time.time()
+            prices = state.recent_prices.get(symbol)
+            px = prices[-1] if prices else None
+            if px is not None:
+                low_px  = px if low_px  is None else min(low_px,  px)
+                high_px = px if high_px is None else max(high_px, px)
+
+            if entered:
+                since = now - t_entry
+                p     = _shadow_pnl_pct(side, entry_px, px) if px is not None else None
+
+                if p is not None and not b_closed:
+                    if p >= SHADOW_B_TP_PCT:
+                        b_closed, b_exit, b_exit_sec, b_pnl = True, "TP_1.2", round(since, 1), SHADOW_B_TP_PCT
+                    elif p <= SHADOW_B_SL_PCT:
+                        b_closed, b_exit, b_exit_sec, b_pnl = True, "SL_1.5", round(since, 1), SHADOW_B_SL_PCT
+                if p is not None and not b_closed and not b_5m_checked and since >= SHADOW_5M_SEC:
+                    b_5m_checked = True
+                    b_5m_pnl     = round(p, 3)
+
+                if p is not None and not c_closed:
+                    if not c_partial:
+                        if p >= SHADOW_C_TP1_PCT:
+                            c_partial = True
+                            c_max     = p
+                        elif p <= SHADOW_B_SL_PCT:
+                            c_closed, c_exit, c_exit_sec, c_pnl = True, "SL_1.5", round(since, 1), SHADOW_B_SL_PCT
+                    else:
+                        c_max = p if c_max is None else max(c_max, p)
+                        if p <= SHADOW_C_BEP_PCT:
+                            c_closed   = True
+                            c_exit     = "BEP_STOP"
+                            c_exit_sec = round(since, 1)
+                            c_pnl      = round(SHADOW_C_PARTIAL_R * SHADOW_C_TP1_PCT
+                                               + (1 - SHADOW_C_PARTIAL_R) * SHADOW_C_BEP_PCT, 3)
+                        elif c_max >= SHADOW_C_TRAIL_ACT and (c_max - p) >= SHADOW_C_TRAIL_DIST:
+                            c_closed   = True
+                            c_exit     = "TRAIL"
+                            c_exit_sec = round(since, 1)
+                            c_pnl      = round(SHADOW_C_PARTIAL_R * SHADOW_C_TP1_PCT
+                                               + (1 - SHADOW_C_PARTIAL_R) * p, 3)
+
+                if b_closed and c_closed:
+                    break
+                if since >= SHADOW_TRACK_SEC:
+                    break
+                time.sleep(0.1)
+            else:
+                # 가상 진입이 없어도 A(실제 매매) 관찰은 10분 유지
+                if now - t_start >= SHADOW_OBS_SEC + SHADOW_TRACK_SEC:
+                    break
+                time.sleep(0.5)
+
+        # ── 3단계: 만기 처리 + 최종 기록 ──
+        prices = state.recent_prices.get(symbol)
+        px_end = prices[-1] if prices else None
+        if entered:
+            since_end = time.time() - t_entry
+            p_end     = _shadow_pnl_pct(side, entry_px, px_end) if px_end is not None else None
+            if not b_closed:
+                b_closed, b_exit = True, "TIME_10M"
+                b_exit_sec = round(min(since_end, SHADOW_TRACK_SEC), 1)
+                b_pnl      = round(p_end, 3) if p_end is not None else None
+            if not c_closed:
+                c_closed, c_exit = True, "TIME_10M"
+                c_exit_sec = round(min(since_end, SHADOW_TRACK_SEC), 1)
+                if c_partial and p_end is not None:
+                    c_pnl = round(SHADOW_C_PARTIAL_R * SHADOW_C_TP1_PCT
+                                  + (1 - SHADOW_C_PARTIAL_R) * p_end, 3)
+                else:
+                    c_pnl = round(p_end, 3) if p_end is not None else None
+        else:
+            b_exit, c_exit = "NO_ENTRY", "NO_ENTRY"
+
+        a_low_pct = round((low_px  - signal_price) / signal_price * 100, 3) if low_px and signal_price else None
+        a_high_pct = round((high_px - signal_price) / signal_price * 100, 3) if high_px and signal_price else None
+        a_target_hit = None
+        if entry_target and low_px is not None and high_px is not None:
+            if side == "buy":
+                a_target_hit = bool(low_px <= entry_target)
+            else:
+                a_target_hit = bool(high_px >= entry_target)
+
+        _upsert({
+            "shadow_done":            True,
+            "shadow_entered":         entered,
+            "shadow_entry_price":     entry_px,
+            "shadow_b_exit":          b_exit,
+            "shadow_b_exit_sec":      b_exit_sec,
+            "shadow_b_pnl_pct":       b_pnl,
+            "shadow_b_5m_pnl_pct":    b_5m_pnl,
+            "shadow_b_5m_below_0_5":  (b_5m_pnl is not None and b_5m_pnl < 0.5),
+            "shadow_c_exit":          c_exit,
+            "shadow_c_exit_sec":      c_exit_sec,
+            "shadow_c_pnl_pct":       c_pnl,
+            "shadow_c_partial_hit":   c_partial,
+            "shadow_a_limit":         entry_target,
+            "shadow_a_target_hit":    a_target_hit,
+            "shadow_a_low_pct":       a_low_pct,
+            "shadow_a_high_pct":      a_high_pct,
+            "shadow_track_sec":       round(time.time() - t_start, 1),
+            "shadow_ts_done":         time.time(),
+        })
+    except Exception as e:
+        print(f"[_track_shadow_versions] {symbol} 예외: {e}")
+        try:
+            _upsert({
+                "shadow_done":    True,
+                "shadow_error":   str(e),
+                "shadow_entered": entered,
+                "shadow_entry_price": entry_px,
+                "shadow_b_exit":  b_exit,
+                "shadow_b_pnl_pct": b_pnl,
+                "shadow_c_exit":  c_exit,
+                "shadow_c_pnl_pct": c_pnl,
+                "shadow_track_sec": round(time.time() - t_start, 1),
+            })
+        except Exception:
+            pass
+
+
 def _delayed_confirm_and_enter(
     signal_id, symbol, initial_price, initial_side,
     base, entry_bucket, strength, zone,
@@ -494,14 +772,16 @@ def _delayed_confirm_and_enter(
                 candle_high = s_now.get("h")
                 candle_low  = s_now.get("l")
 
+                # ✅ [로그 버그수정] 지정가 진입은 buy=아래로 내려와 체결, sell=위로 올라와 체결.
+                #    기존 코드는 buy에서 고가를 비교해 사실상 항상 True가 되는 부호 반전 버그가 있었다.
                 if initial_side == "buy":
-                    target_hit = (candle_high or 0) >= last_target
+                    target_hit = (candle_low or 0) <= last_target if candle_low else False
                     mfe_pct    = ((candle_high - initial_price) / initial_price * 100
                                   if candle_high else 0)
                     mae_pct    = ((candle_low  - initial_price) / initial_price * 100
                                   if candle_low  else 0)
                 else:
-                    target_hit = (candle_low or 999999) <= last_target
+                    target_hit = (candle_high or 0) >= last_target if candle_high else False
                     mfe_pct    = ((initial_price - candle_low)  / initial_price * 100
                                   if candle_low  else 0)
                     mae_pct    = ((initial_price - candle_high) / initial_price * 100
@@ -948,7 +1228,9 @@ def try_enter_on_price(symbol, price):
 
     s            = state.bar_state[symbol]
     entry_bucket = s["bucket"]
-    signal_id    = f"{symbol}-{entry_bucket}-{initial_side}"
+    # ✅ [로그 버그수정] APP_ID를 포함해 1·2번 봇이 같은 캔들에 동시 신호를 내도
+    #    record_id(=Postgres PK)가 서로 덮어쓰지 않도록 한다. (서버는 record_id를 파싱하지 않음)
+    signal_id    = f"{symbol}-{entry_bucket}-{initial_side}-{state.APP_ID}"
 
     adx_val       = get_adx(symbol)
     adx_str       = f"{adx_val:.1f}" if adx_val is not None else "N/A"
@@ -1053,6 +1335,13 @@ def try_enter_on_price(symbol, price):
         target=_track_signal_timeline,
         args=(symbol, signal_id, initial_side, price),
         kwargs={"duration": 4.0, "interval": 0.2},
+        daemon=True,
+    ).start()
+
+    # ✅ [v3.0.0] 3버전 비교용 그림자 추적 (실제 매매 로직과 무관, 관찰 전용)
+    Thread(
+        target=_track_shadow_versions,
+        args=(symbol, signal_id, initial_side, price, target_price),
         daemon=True,
     ).start()
 

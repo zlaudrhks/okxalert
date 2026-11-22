@@ -214,7 +214,7 @@ def load_initial_state():
                 "exited":         False,
                 "exit_intent":    None,
                 "zone":           "RESTORED",
-                "signal_id":      f"RESTORE-{symbol}",
+                "signal_id":      f"RESTORE-{symbol}-{state.APP_ID}",
                 "entry_time":     time.time(),
                 "max_profit_pct": 0.0,
                 "entry_bucket":   None,
