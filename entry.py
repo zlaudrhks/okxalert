@@ -353,7 +353,7 @@ def _delayed_confirm_and_enter(
         candle_cancelled = False
         sz, entry        = 0, None
 
-        while time.time() - start_time < SLIDING_TOTAL:
+        while state.SLIDING_ENABLED and time.time() - start_time < SLIDING_TOTAL:
             if state.bar_state[symbol]["bucket"] != entry_bucket:
                 cancel_order(symbol, main_id)
                 sz_check, entry_check = _check_filled_despite_cancel(symbol, main_id, initial_side)

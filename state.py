@@ -13,9 +13,9 @@ SYMBOLS_PER_APP = 100
 # 전역 상태
 # ==========================================
 trading_enabled = True
-adx_filter_enabled = True
+adx_filter_enabled = False  # 기본 OFF
 risk_guard_triggered = False
-vol_exhausted_filter_enabled = True
+vol_exhausted_filter_enabled = False  # 기본 OFF
 
 positions = {}
 pending_entries = set()
@@ -88,7 +88,7 @@ SL_PCT              = 0.015
 usdt_amount         = 1500
 total_pnl_usdt      = 0.0
 
-ENTRY_SLIP_ENABLED = True
+ENTRY_SLIP_ENABLED = False  # 기본 OFF
 ENTRY_SLIP_PCT     = 0.015
 MAX_LOSS_USDT       = -200
 SYMBOL_BLACKLIST    = set()
@@ -102,7 +102,7 @@ ENTRY_WATCH_SEC     = 3
 PARTIAL_TP_ENABLED        = False
 PARTIAL_TP_PCT            = 0.010    # 1차 익절 목표: +1.0% (수수료 제하고 순익 조기 확보)
 PARTIAL_TP_RATIO          = 0.50     # 1차 익절 수량: 50%
-BEP_STOP_ENABLED          = True     # 1차 익절 후 잔여 수량 스탑로스를 본절가(BEP)로 이동
+BEP_STOP_ENABLED          = False    # 기본 OFF (1차 분할익절 OFF 시 동작 없음) - 1차 익절 후 잔여 수량 스탑로스를 본절가(BEP)로 이동
 BEP_BUFFER_PCT            = 0.001    # 본절 스탑 버퍼 (+0.1%로 슬리피지/수수료 완벽 보전)
 TP2_EXTEND_MULT           = 1.5      # 잔여 50%의 2차 목표가 배수 (1.5x ~ 2.0x)
 
