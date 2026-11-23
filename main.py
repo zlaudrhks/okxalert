@@ -346,11 +346,65 @@ def fetch_control_commands():
                         main = pos.get("main")
                         if main and main.get("alive"):
                             main["skip_time_exit"] = True
-                send_telegram(f"🟢 거래 활성화 (APP {state.APP_ID})")
+                send_telegram(f"🟢 거래 활성화 (APP {state.APP_ID})\n버전: {state.TRADE_VERSION}")
 
             elif c == "꺼":
                 state.trading_enabled = False
-                send_telegram(f"🔴 거래 중지 (APP {state.APP_ID})")
+                send_telegram(f"🔴 거래 중지 (APP {state.APP_ID})\n버전: {state.TRADE_VERSION} (알람 전용)")
+
+            # ── [v3.3] A / B / C 실매매 버전 전환 (상호 배타적) ──
+            elif c in ("a버전켜", "b버전켜", "c버전켜"):
+                ver = {"a버전켜": "A", "b버전켜": "B", "c버전켜": "C"}[c]
+                state.TRADE_VERSION        = ver
+                state.trading_enabled      = True
+                state.risk_guard_triggered = False
+                with state.lock:
+                    for sym, pos in list(state.positions.items()):
+                        main = pos.get("main")
+                        if main and main.get("alive"):
+                            main["skip_time_exit"] = True
+                desc = {
+                    "A": "3σ+추가이격+슬라이딩 지정가",
+                    "B": f"5~15초 거래량소진(<{state.TRADE_VOL_THRESHOLD})+0.2% 꺾임 → 즉시진입 · 단일 OCO(TP +1.2%/SL -1.5%)",
+                    "C": f"B 진입 + 1.0% 50% 분할익절 → 본절(+0.1%) 스탑 → 1.2% 후 0.4% 트레일링 (소진기준 {state.TRADE_VOL_THRESHOLD})",
+                }[ver]
+                send_telegram(
+                    f"🚀 {ver}버전 실매매 ON (APP {state.APP_ID})\n"
+                    f"방식: {desc}\n"
+                    f"나머지 버전은 자동 OFF"
+                )
+
+            elif c in ("a버전꺼", "b버전꺼", "c버전꺼"):
+                ver = {"a버전꺼": "A", "b버전꺼": "B", "c버전꺼": "C"}[c]
+                cur = state.TRADE_VERSION
+                state.trading_enabled = False
+                if cur == ver:
+                    send_telegram(
+                        f"🔻 {ver}버전 OFF → 알람 전용 (APP {state.APP_ID})\n"
+                        f"다시 켜려면 {ver.lower()}버전켜"
+                    )
+                else:
+                    send_telegram(
+                        f"🔻 매매 OFF → 알람 전용 (APP {state.APP_ID})\n"
+                        f"현재 설정 버전은 {cur}버전입니다 (요청: {ver}버전꺼)"
+                    )
+
+            elif c == "소진기준":
+                new_val = cmd.get("value")
+                if new_val is None:
+                    send_telegram(f"⚠️ 소진기준 값이 없습니다 (0.4 / 0.5 / 0.6)")
+                elif round(float(new_val), 2) not in state.VALID_VOL_THRESHOLDS:
+                    send_telegram(
+                        f"⚠️ 소진기준은 0.4 / 0.5 / 0.6 만 가능 (APP {state.APP_ID})\n"
+                        f"입력값: {new_val}"
+                    )
+                else:
+                    state.TRADE_VOL_THRESHOLD = round(float(new_val), 2)
+                    send_telegram(
+                        f"📐 B/C 진입 소진기준 변경 (APP {state.APP_ID})\n"
+                        f"late/early < {state.TRADE_VOL_THRESHOLD}\n"
+                        f"(가상 비교 로깅은 0.4·0.5·0.6 계속 동시 추적)"
+                    )
 
             elif c == "청산":
                 send_telegram(f"⚠️ 전체 포지션 청산 실행 (APP {state.APP_ID})")
@@ -370,6 +424,8 @@ def fetch_control_commands():
                     f"📊 FastBand v{getattr(state, 'APP_VERSION', '2.0.0')} 상태 (APP {state.APP_ID})\n\n"
                     f"🟢 거래상태\n"
                     f"거래활성화 : {'ON' if state.trading_enabled else 'OFF'}\n"
+                    f"실매매 버전 : {state.TRADE_VERSION}버전 ({'ON' if state.trading_enabled else 'OFF'})\n"
+                    f"B/C 소진기준 : late/early < {state.TRADE_VOL_THRESHOLD}\n"
                     f"활성포지션 : {pos_count}개\n"
                     f"누적PnL : {state.total_pnl_usdt:.2f} USDT\n\n"
                     f"💰 진입 및 익절/손절 (v2)\n"
@@ -668,12 +724,26 @@ def fetch_control_commands():
                 send_telegram(
                     f"📋 FastBand 명령어 (APP {state.APP_ID})\n\n"
                     f"🟢 거래제어\n켜 / 꺼 / 청산 / 상태 / 초기화\n\n"
+                    f"🚀 실매매 버전 (A/B/C — 하나를 켜면 나머지는 자동 OFF, 재시작 기본은 A)\n"
+                    f"a버전켜 / a버전꺼\n"
+                    f"  A: 기존 매매 — 볼린저 3σ 오버슈팅 + 추가이격 + 슬라이딩 지정가\n"
+                    f"b버전켜 / b버전꺼\n"
+                    f"  B: 신호 후 5~15초 거래량소진(late/early<소진기준) + 직전 고/저점 대비 0.2% 꺾임 확인 → 현재가 즉시 진입 · 단일 OCO(TP +1.2% / SL -1.5%)\n"
+                    f"c버전켜 / c버전꺼\n"
+                    f"  C: B와 같은 진입 + 1.0%에서 50% 분할익절 → 잔여 본절(+0.1%) 스탑 → 최고 1.2% 후 0.4% 되돌림 트레일링 청산 (SL -1.5%)\n"
+                    f"소진기준 0.4  (또는 0.5 / 0.6)\n"
+                    f"  B·C 진입 판정의 거래량 소진 기준 (기본 0.4)\n"
+                    f"  ※ 가상 비교 로깅(A + B/C 0.4·0.5·0.6)은 매매 ON/OFF·버전과 무관하게 계속 돌아갑니다\n\n"
                     f"💰 포지션\n사이즈 100 / tp 1.5 / sl 2.0 / 대기시간 2\n\n"
                     f"📈 필터\nadx켜 / adx꺼 / adx 25 / vol켜 / vol꺼\n"
                     f"rsi켜 / rsi꺼 / rsi롱 30 / rsi숏 70\n\n"
                     f"⚡ 슬리피지·슬라이딩\n"
                     f"slip켜 / slip꺼 / slip비율 1.5\n"
-                    f"슬라이딩켜 / 슬라이딩꺼\n\n"
+                    f"슬라이딩켜 / 슬라이딩꺼 (A버전 전용)\n\n"
+                    f"🔧 v2 기능\n"
+                    f"atr켜 / atr꺼 / btc서킷켜 / btc서킷꺼\n"
+                    f"분할익절켜 / 분할익절꺼 / 트레일켜 / 트레일꺼\n"
+                    f"  ※ 분할익절·트레일링은 A버전의 수동 토글이고, C버전은 자동 적용됩니다\n\n"
                     f"📐 추가이격\n추가이격켜 / 추가이격꺼\n"
                     f"변화율합 10 / 이격비율 1.0\n"
                     f"이격1 0.5 / 이격2 1.0 / 이격3 1.5\n\n"

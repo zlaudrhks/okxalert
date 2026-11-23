@@ -4,7 +4,7 @@ from collections import deque, defaultdict
 # ==========================================
 # 앱 설정
 # ==========================================
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.3.0"
 APP_ID = 1
 TOTAL_SYMBOLS = 210
 SYMBOLS_PER_APP = 100
@@ -147,3 +147,26 @@ LEARNED_MIN_DIST  = {}
 LEARNED_EXTRA_PCT = {}  # key: 구간 index (0,1,2)
 
 SLIDING_ENABLED = True  # 기본 ON
+
+# ==========================================
+# [v3.3] A / B / C 실매매 버전 전환
+#   - A: 기존 매매 (3σ 오버슈팅 + 추가이격 + 슬라이딩 지정가)
+#   - B: 신호 후 5~15초 거래량소진(late/early < TRADE_VOL_THRESHOLD) + 0.2% 꺾임 확인 후
+#        현재가 즉시 진입 → 단일 OCO (TP +1.2% / SL -1.5%)
+#   - C: B와 같은 진입 + 1.0% 50% 분할익절 → 본절(+0.1%) 스탑 → 1.2% 후 0.4% 트레일링
+#   * 세 버전은 상호 배타적이며(하나를 켜면 나머지는 꺼짐) 재시작 기본값은 항상 "A"
+# ==========================================
+TRADE_VERSION       = "A"    # "A" | "B" | "C" (재시작 기본 A)
+TRADE_VOL_THRESHOLD = 0.4    # B/C 진입의 거래량 소진 기준 (0.4 / 0.5 / 0.6)
+TRADE_VER_HOOK_PCT  = 0.002  # B/C 진입의 꺾임 기준 (직전 고/저점 대비 0.2%)
+TRADE_VER_OBS_SEC   = 15.0   # B/C 진입 판정 관찰 구간 (신호 후 최대 15초)
+TRADE_VER_MIN_TICKS = 4      # 이보다 틱이 적으면 판정 불가 (진입하지 않음)
+TRADE_B_TP_PCT      = 0.012  # B 단일 OCO 목표 (+1.2%)
+TRADE_B_SL_PCT      = 0.015  # B / C 손절 (-1.5%)
+TRADE_C_TP1_PCT     = 0.010  # C 1차 분할익절 목표 (+1.0%)
+TRADE_C_PARTIAL_R   = 0.50   # C 1차 분할익절 수량 비율 (50%)
+TRADE_C_BEP_PCT     = 0.001  # C 본절 스탑 버퍼 (+0.1%)
+TRADE_C_TRAIL_ACT   = 1.2    # C 트레일링 가동 최고 수익 (%)
+TRADE_C_TRAIL_DIST  = 0.4    # C 트레일링 되돌림 (%)
+VALID_TRADE_VERSIONS   = ("A", "B", "C")
+VALID_VOL_THRESHOLDS   = (0.4, 0.5, 0.6)

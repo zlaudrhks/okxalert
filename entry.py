@@ -113,7 +113,14 @@ def _execute_partial_tp_and_bep(symbol, pos, current_price):
         lot_sz = float(meta.get("lotSz", 1))
         min_sz = float(meta.get("minSz", 1))
 
-        close_sz = adjust_size(total_sz * state.PARTIAL_TP_RATIO, lot_sz, min_sz)
+        # ✅ [v3.3] C 버전은 C 규칙(50% / +0.1% 본절)을 쓰고, A 버전은 기존 글로벌 설정을 따른다
+        part_ratio = state.PARTIAL_TP_RATIO
+        bep_buffer = state.BEP_BUFFER_PCT
+        if pos.get("trade_version") == "C":
+            part_ratio = float(getattr(state, "TRADE_C_PARTIAL_R", state.PARTIAL_TP_RATIO))
+            bep_buffer = float(getattr(state, "TRADE_C_BEP_PCT", state.BEP_BUFFER_PCT))
+
+        close_sz = adjust_size(total_sz * part_ratio, lot_sz, min_sz)
         remain_sz = adjust_size(total_sz - close_sz, lot_sz, min_sz)
 
         if close_sz <= 0 or remain_sz < min_sz:
@@ -138,10 +145,10 @@ def _execute_partial_tp_and_bep(symbol, pos, current_price):
         tp2_pct = tp_pct * state.TP2_EXTEND_MULT
 
         if side == "buy":
-            bep_sl = round_to_tick(symbol, entry * (1 + state.BEP_BUFFER_PCT))
+            bep_sl = round_to_tick(symbol, entry * (1 + bep_buffer))
             tp2 = round_to_tick(symbol, entry * (1 + tp2_pct))
         else:
-            bep_sl = round_to_tick(symbol, entry * (1 - state.BEP_BUFFER_PCT))
+            bep_sl = round_to_tick(symbol, entry * (1 - bep_buffer))
             tp2 = round_to_tick(symbol, entry * (1 - tp2_pct))
 
         # 4. 잔여 50%에 대한 신규 OCO 설정 (TP2 / 본절 SL)
@@ -641,6 +648,270 @@ def _log_order_fail(signal_id, symbol):
         order_size=err.get("size"),
         order_usdt=err.get("usdt"),
     )
+
+
+def _entry_order_size(symbol, price, order_usdt):
+    """USDT 금액 → 계약 수 (place_limit_order 와 동일한 ctVal/lotSz/minSz 규칙)"""
+    meta  = state.instrument_meta.get(symbol, {"ctVal": 1, "lotSz": 1, "minSz": 1})
+    ctVal = float(meta.get("ctVal", 1))
+    lotSz = float(meta.get("lotSz", 1))
+    minSz = float(meta.get("minSz", 1))
+    if not price or price <= 0:
+        return 0.0
+    contracts = order_usdt / (price * ctVal)
+    return adjust_size(contracts, lotSz, minSz)
+
+
+def _b_version_confirm_and_enter(
+    signal_id, symbol, signal_price, initial_side,
+    entry_bucket, zone, order_usdt, version,
+):
+    """
+    [v3.3] B / C 버전 실매매 진입 (실제 주문 발생).
+      - 신호 후 최대 15초 관찰: 전반 5초 vs 후반 5초 틱 거래량 비율이
+        state.TRADE_VOL_THRESHOLD(0.4/0.5/0.6) 미만 + 틱 수 >= 4 + 직전 고/저점 대비 0.2% 꺾임
+      - 충족 시 현재가로 즉시 체결(시장가) → 단일 OCO (TP +1.2% / SL -1.5%)
+      - C 버전은 진입 후 try_enter_on_price 가 1.0% 50% 분할익절 → 본절(+0.1%) 스탑 → 트레일링
+      - 미충족 시 trade_log 에 BLOCKED_B_VOL / BLOCKED_B_HOOK / BLOCKED_B_TICK 기록
+    실제 A 로직은 건드리지 않는다.
+    """
+    try:
+        if get_real_position_size(symbol) > 0:
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "POSITION_ALREADY_OPEN", trade_version=version)
+            return
+        if get_real_open_orders(symbol):
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "OPEN_ORDER_EXISTS", trade_version=version)
+            return
+        if not set_leverage(symbol, cfg.LEVERAGE):
+            _log_entry_blocked(signal_id, "ORDER_FAIL", "LEVERAGE_FAIL", trade_version=version)
+            send_telegram(f"❌ 레버리지 설정 실패 - {symbol}")
+            return
+
+        threshold = float(getattr(state, "TRADE_VOL_THRESHOLD", SHADOW_VOL_THRESHOLD))
+        hook_pct  = float(getattr(state, "TRADE_VER_HOOK_PCT", SHADOW_HOOK_PCT))
+        obs_sec   = float(getattr(state, "TRADE_VER_OBS_SEC", SHADOW_OBS_SEC))
+        min_ticks = int(getattr(state, "TRADE_VER_MIN_TICKS", SHADOW_MIN_TICKS))
+
+        t_start = time.time()
+        ref_sec = int(t_start)
+        vol_by_sec, tick_by_sec = {}, {}
+        low_px = high_px = None
+        vol_ratio = None
+        vol_ticks = 0
+        hook_now  = None
+        enter_px  = None
+        wait_sec  = None
+
+        def _collect():
+            per_vol, per_cnt = {}, {}
+            for t_sec, v in list(state.recent_tick_volumes.get(symbol, [])):
+                if ref_sec <= t_sec < ref_sec + int(SHADOW_LATE_SEC):
+                    per_vol[t_sec] = per_vol.get(t_sec, 0.0) + float(v or 0)
+                    per_cnt[t_sec] = per_cnt.get(t_sec, 0) + 1
+            for t_sec, v in per_vol.items():
+                if v > vol_by_sec.get(t_sec, 0.0):
+                    vol_by_sec[t_sec] = v
+            for t_sec, n in per_cnt.items():
+                if n > tick_by_sec.get(t_sec, 0):
+                    tick_by_sec[t_sec] = n
+
+        while True:
+            now = time.time()
+            if state.bar_state[symbol]["bucket"] != entry_bucket:
+                _log_entry_blocked(signal_id, "STALE_CANDLE", "CANDLE_CHANGED_BEFORE_B_ENTRY", trade_version=version)
+                return
+            prices = state.recent_prices.get(symbol)
+            px = prices[-1] if prices else None
+            if px is None:
+                px = signal_price
+            low_px  = px if low_px  is None else min(low_px,  px)
+            high_px = px if high_px is None else max(high_px, px)
+
+            _collect()
+
+            elapsed = now - t_start
+            if elapsed >= SHADOW_LATE_SEC:
+                split     = ref_sec + int(SHADOW_EARLY_SEC)
+                vol_early = sum(v for t, v in vol_by_sec.items() if t < split)
+                vol_late  = sum(v for t, v in vol_by_sec.items() if t >= split)
+                vol_ticks = int(sum(tick_by_sec.values()))
+                if vol_early > 0 and vol_ticks >= min_ticks:
+                    vol_ratio = round(vol_late / vol_early, 4)
+
+                hook = False
+                if low_px and high_px:
+                    if initial_side == "buy":
+                        hook_now = round((px - low_px) / low_px * 100, 3)
+                        hook     = px >= low_px * (1 + hook_pct)
+                    else:
+                        hook_now = round((high_px - px) / high_px * 100, 3)
+                        hook     = px <= high_px * (1 - hook_pct)
+
+                if (vol_ratio is not None and vol_ratio < threshold and hook
+                        and elapsed <= obs_sec):
+                    enter_px = px
+                    wait_sec = round(elapsed, 2)
+                    break
+
+            if elapsed >= obs_sec:
+                break
+            time.sleep(0.25)
+
+        if enter_px is None:
+            if vol_ticks < min_ticks:
+                reason = "BLOCKED_B_TICK"
+                detail = f"틱 부족 ({vol_ticks} < {min_ticks})"
+            elif vol_ratio is None or vol_ratio >= threshold:
+                reason = "BLOCKED_B_VOL"
+                detail = f"거래량 미소진 (late/early {vol_ratio} ≥ 기준 {threshold})"
+            else:
+                reason = "BLOCKED_B_HOOK"
+                detail = f"꺾임 미충족 ({hook_now}% < 기준 {round(hook_pct*100, 2)}%)"
+            _upsert_trade_log(signal_id, {
+                "result":               reason,
+                "trade_version":        version,
+                "block_reason":         reason,
+                "vol_late_early_ratio": vol_ratio,
+                "vol_tick_count":       vol_ticks,
+                "vol_threshold":        threshold,
+                "hook_pct":             hook_now,
+                "hook_threshold":       round(hook_pct * 100, 3),
+            })
+            send_telegram(
+                f"⛔ {version}버전 진입 취소 - {symbol}\n"
+                f"{detail}\n"
+                f"vol_ratio: {vol_ratio} | ticks: {vol_ticks} | hook: {hook_now}%"
+            )
+            return
+
+        # ── 현재가 즉시 체결 주문 (시장가) ──
+        sz = _entry_order_size(symbol, enter_px, order_usdt)
+        if sz <= 0:
+            _log_entry_blocked(signal_id, "ORDER_FAIL", "SIZE_TOO_SMALL", trade_version=version)
+            send_telegram(f"❌ {version}버전 주문 수량 계산 실패 - {symbol}")
+            return
+
+        ord_id = place_market_order(symbol, initial_side, sz, reduce_only=False)
+        if not ord_id:
+            _log_order_fail(signal_id, symbol)
+            return
+
+        filled_sz, entry = get_filled_info(symbol, ord_id, retries=6, delay=0.4)
+        if filled_sz <= 0:
+            pos_sz = wait_position_visible(symbol, initial_side, timeout=3.0)
+            if pos_sz > 0:
+                filled_sz = pos_sz
+                entry     = get_rest_last_price(symbol) or enter_px
+        if filled_sz <= 0:
+            _log_entry_blocked(signal_id, "ORDER_FAIL", "NO_FILL", trade_version=version)
+            send_telegram(f"❌ {version}버전 시장가 체결 확인 실패 - {symbol}")
+            return
+        if not entry:
+            entry = enter_px
+
+        tp_pct = float(getattr(state, "TRADE_B_TP_PCT", SHADOW_B_TP_PCT))
+        sl_pct = float(getattr(state, "TRADE_B_SL_PCT", SHADOW_B_SL_PCT))
+
+        with state.lock:
+            state.last_entry_time[symbol] = time.time()
+            state.positions.setdefault(symbol, {})
+            state.positions[symbol]["main"] = {
+                "side":           initial_side,
+                "entry":          entry,
+                "sz":             filled_sz,
+                "final_target":   entry,
+                "oco_id":         None,
+                "signal_id":      signal_id,
+                "zone":           zone,
+                "entry_time":     time.time(),
+                "max_profit_pct": 0.0,
+                "position_high":  entry,
+                "position_low":   entry,
+                "alive":          True,
+                "exited":         False,
+                "entry_bucket":   entry_bucket,
+                "exit_intent":    None,
+                "trade_version":  version,
+                "tp_pct":         tp_pct,
+                "sl_pct":         sl_pct,
+            }
+
+        tp_px = entry * (1 + tp_pct) if initial_side == "buy" else entry * (1 - tp_pct)
+        _upsert_trade_log(signal_id, {
+            "result":               "HIT",
+            "trade_version":        version,
+            "entry":                entry,
+            "signal_price":         signal_price,
+            "final_target":         round_to_tick(symbol, tp_px),
+            "target_hit":           False,
+            "mfe_pct":              0.0,
+            "mae_pct":              0.0,
+            "max_profit_pct":       0.0,
+            "vol_late_early_ratio": vol_ratio,
+            "vol_tick_count":       vol_ticks,
+            "vol_threshold":        threshold,
+            "hook_pct":             hook_now,
+            "b_wait_sec":           wait_sec,
+            "tp_pct":               round(tp_pct * 100, 3),
+            "sl_pct":               round(sl_pct * 100, 3),
+        })
+
+        close_side = "sell" if initial_side == "buy" else "buy"
+        if get_rest_last_price(symbol) is None:
+            send_telegram(f"⚠️ {symbol} REST 가격 조회 실패 → OCO 스킵")
+            return
+
+        pos_sz = wait_position_visible(symbol, initial_side, timeout=3.0)
+        if pos_sz <= 0:
+            send_telegram(f"⚠️ 포지션 인식 실패 → OCO 중단\n{symbol}")
+            return
+        with state.lock:
+            m = state.positions.get(symbol, {}).get("main")
+            if m:
+                m["sz"] = pos_sz
+
+        oco_id = None
+        for retry in range(3):
+            relax = 1 + 0.25 * retry
+            if initial_side == "buy":
+                tp = round_to_tick(symbol, entry * (1 + tp_pct * relax))
+                sl = round_to_tick(symbol, entry * (1 - sl_pct * relax))
+            else:
+                tp = round_to_tick(symbol, entry * (1 - tp_pct * relax))
+                sl = round_to_tick(symbol, entry * (1 + sl_pct * relax))
+
+            oco_id = close_position_oco_checked(symbol, close_side, pos_sz, tp, sl)
+            if oco_id:
+                send_telegram(
+                    f"🟢 {version}버전 OCO 설정 ({retry+1}/3) - {symbol}\n"
+                    f"TP: {tp:.6f} (+{tp_pct*100:.2f}%) | SL: {sl:.6f} (-{sl_pct*100:.2f}%)"
+                )
+                break
+
+        if not oco_id:
+            send_telegram(f"🚨 {version}버전 OCO 3회 실패 → 강제청산\n{symbol}")
+            with state.lock:
+                m = state.positions.get(symbol, {}).get("main")
+                if m:
+                    m["exit_intent"] = "OCO_FAILED_RETRY_EXCEEDED"
+            force_market_close_safe(symbol)
+            return
+
+        with state.lock:
+            m = state.positions.get(symbol, {}).get("main")
+            if m:
+                m["oco_id"] = oco_id
+
+        send_telegram(
+            f"🚀 {version}버전 진입 완료 - {symbol}\n"
+            f"Entry: {entry:.6f} | vol_ratio: {vol_ratio} (기준 {threshold})\n"
+            f"판정: 신호 후 {wait_sec}초 | 수량 {pos_sz}"
+        )
+    except Exception as e:
+        send_telegram(f"❌ {version}버전 진입 오류: {e}")
+    finally:
+        with state.lock:
+            state.pending_entries.discard((symbol, "main"))
 
 
 def _delayed_confirm_and_enter(
@@ -1185,10 +1456,33 @@ def try_enter_on_price(symbol, price):
 
         elapsed_min = (time.time() - pos["entry_time"]) / 60
         max_pct     = pos.get("max_profit_pct", 0)
+        pos_ver     = pos.get("trade_version", "A")
+
+        # ✅ [v3.3] 버전별 청산 관리
+        #    C: 분할익절(+1.0% 50%) + 본절(+0.1%) 스탑 + 트레일링(1.2% 후 0.4% 되돌림) 항상 동작
+        #    B: 단일 OCO(TP +1.2% / SL -1.5%) — 분할익절·트레일링 없음
+        #    A: 기존 글로벌 토글 그대로
+        if pos_ver == "C":
+            partial_on  = True
+            trail_on    = True
+            tp1_trigger = float(getattr(state, "TRADE_C_TP1_PCT", state.PARTIAL_TP_PCT)) * 100
+            trail_act   = float(getattr(state, "TRADE_C_TRAIL_ACT", state.TRAIL_ACTIVATE_PCT))
+            trail_dist  = float(getattr(state, "TRADE_C_TRAIL_DIST", state.TRAIL_DISTANCE_PCT))
+        elif pos_ver == "B":
+            partial_on  = False
+            trail_on    = False
+            tp1_trigger = 0.0
+            trail_act   = state.TRAIL_ACTIVATE_PCT
+            trail_dist  = state.TRAIL_DISTANCE_PCT
+        else:
+            partial_on  = state.PARTIAL_TP_ENABLED
+            trail_on    = state.TRAIL_ENABLED
+            tp1_trigger = pos.get("tp_pct", state.PARTIAL_TP_PCT) * 100 if state.ATR_DYNAMIC_ENABLED else state.PARTIAL_TP_PCT * 100
+            trail_act   = state.TRAIL_ACTIVATE_PCT
+            trail_dist  = state.TRAIL_DISTANCE_PCT
 
         # ✅ [v2 개선 1] 1차 분할 익절(50%) 및 본절 스탑(BEP) 이동 트리거
-        tp1_trigger = pos.get("tp_pct", state.PARTIAL_TP_PCT) * 100 if state.ATR_DYNAMIC_ENABLED else state.PARTIAL_TP_PCT * 100
-        if state.PARTIAL_TP_ENABLED and not pos.get("partial_tp_done") and pnl_pct >= tp1_trigger:
+        if partial_on and not pos.get("partial_tp_done") and pnl_pct >= tp1_trigger:
             with state.lock:
                 pos["partial_tp_done"] = True
             Thread(
@@ -1197,8 +1491,8 @@ def try_enter_on_price(symbol, price):
                 daemon=True,
             ).start()
 
-        if state.TRAIL_ENABLED and max_pct >= state.TRAIL_ACTIVATE_PCT:
-            if max_pct - pnl_pct >= state.TRAIL_DISTANCE_PCT:
+        if trail_on and max_pct >= trail_act:
+            if max_pct - pnl_pct >= trail_dist:
                 with state.lock:
                     cur = state.positions.get(symbol, {}).get("main")
                     if cur and cur.get("alive") and cur.get("exit_intent") is None:
@@ -1353,7 +1647,8 @@ def try_enter_on_price(symbol, price):
         if state.adx_filter_enabled:
             return
 
-    status_msg = "실매매 가동" if state.trading_enabled else "알람 전용(OFF)"
+    _tv_now    = getattr(state, "TRADE_VERSION", "A")
+    status_msg = f"실매매 {_tv_now}버전" if state.trading_enabled else "알람 전용(OFF)"
     now        = time.time()
     last_alarm = state.last_alarm_time.get(symbol, 0)
     if not state.trading_enabled and now - last_alarm < state.ALARM_COOLDOWN_SEC:
@@ -1384,22 +1679,27 @@ def try_enter_on_price(symbol, price):
     #      (알람 전용에서 설정하면 finally의 pop이 돌지 않아 try_enter_on_price가 그 종목을 계속 삼키고,
     #       매매 ON에서 늦게 설정하면 전송 중 들어온 틱에 중복 알람/중복 로그가 생긴다)
     alarm_only = not state.trading_enabled
+    trade_ver  = _tv_now
+    if trade_ver not in ("A", "B", "C"):
+        trade_ver = "A"
 
     if alarm_only:
         main_usdt = None
     else:
-        state.sliding_state[symbol] = {
-            "signal_id":    signal_id,
-            "side":         initial_side,
-            "base":         base,
-            "zone":         zone,
-            "strength":     strength,
-            "start_ts":     time.time(),
-            "entry_bucket": entry_bucket,
-            "best_price":   price,
-        }
         size_mult = cfg.ZONE_SIZE_MULT.get(zone, 1.0)
         main_usdt = state.usdt_amount * size_mult
+        # A 버전만 슬라이딩 상태를 만든다 (B/C 는 5~15초 판정 스레드가 직접 관리)
+        if trade_ver == "A":
+            state.sliding_state[symbol] = {
+                "signal_id":    signal_id,
+                "side":         initial_side,
+                "base":         base,
+                "zone":         zone,
+                "strength":     strength,
+                "start_ts":     time.time(),
+                "entry_bucket": entry_bucket,
+                "best_price":   price,
+            }
 
     _upsert_trade_log(signal_id, {
         "symbol":              symbol,
@@ -1431,6 +1731,8 @@ def try_enter_on_price(symbol, price):
         "mae_pct":             None,
         "max_profit_pct":      None,
         "trading_enabled":     state.trading_enabled,
+        "trade_version":       trade_ver,
+        "trade_version_active": not alarm_only,
         "result":              "ALARM_ONLY" if alarm_only else "PENDING",
         "entry":               None,
         "exit_price":          None,
@@ -1456,6 +1758,19 @@ def try_enter_on_price(symbol, price):
 
     # 매매 OFF(알람 전용)는 여기까지 — 주문·포지션 상태는 건드리지 않는다.
     if alarm_only:
+        return
+
+    # ✅ [v3.3] B / C 버전: 5~15초 거래량소진 + 0.2% 꺾임 확인 후 현재가 즉시 진입
+    #    (B: 단일 OCO / C: 진입 후 1.0% 분할익절·본절·트레일링)
+    if trade_ver in ("B", "C"):
+        with state.lock:
+            state.pending_entries.add((symbol, "main"))
+            state.last_entry_time[symbol] = time.time()
+        Thread(
+            target=_b_version_confirm_and_enter,
+            args=(signal_id, symbol, price, initial_side, entry_bucket, zone, main_usdt, trade_ver),
+            daemon=True,
+        ).start()
         return
 
     with state.lock:
