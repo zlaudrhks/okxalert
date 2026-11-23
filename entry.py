@@ -1310,9 +1310,26 @@ def try_enter_on_price(symbol, price):
     # ✅ [v3.1] 매매 OFF(알람 전용)여도 '알람이 나간 신호'는 3버전 가상 분석을 남긴다.
     #   - 알람 전용: trade_log(결과 ALARM_ONLY) + _track_shadow_versions 만 실행
     #   - 실매매 ON: 기존과 동일 (슬라이딩 / 주문 / 진입 대기)
-    #   ⚠️ sliding_state는 매매 ON일 때만 설정한다. 알람 전용에서 설정하면
-    #      finally의 pop이 돌지 않아 try_enter_on_price가 그 종목을 계속 삼키게 된다.
+    #   ⚠️ sliding_state는 매매 ON일 때만, 그리고 _upsert_trade_log(네트워크)보다 먼저 설정한다.
+    #      (알람 전용에서 설정하면 finally의 pop이 돌지 않아 try_enter_on_price가 그 종목을 계속 삼키고,
+    #       매매 ON에서 늦게 설정하면 전송 중 들어온 틱에 중복 알람/중복 로그가 생긴다)
     alarm_only = not state.trading_enabled
+
+    if alarm_only:
+        main_usdt = None
+    else:
+        state.sliding_state[symbol] = {
+            "signal_id":    signal_id,
+            "side":         initial_side,
+            "base":         base,
+            "zone":         zone,
+            "strength":     strength,
+            "start_ts":     time.time(),
+            "entry_bucket": entry_bucket,
+            "best_price":   price,
+        }
+        size_mult = cfg.ZONE_SIZE_MULT.get(zone, 1.0)
+        main_usdt = state.usdt_amount * size_mult
 
     _upsert_trade_log(signal_id, {
         "symbol":              symbol,
@@ -1367,23 +1384,9 @@ def try_enter_on_price(symbol, price):
         daemon=True,
     ).start()
 
-    # 매매 OFF(알람 전용)는 여기까지 — 주문·포지션·슬라이딩 상태는 건드리지 않는다.
+    # 매매 OFF(알람 전용)는 여기까지 — 주문·포지션 상태는 건드리지 않는다.
     if alarm_only:
         return
-
-    size_mult = cfg.ZONE_SIZE_MULT.get(zone, 1.0)
-    main_usdt = state.usdt_amount * size_mult
-
-    state.sliding_state[symbol] = {
-        "signal_id":    signal_id,
-        "side":         initial_side,
-        "base":         base,
-        "zone":         zone,
-        "strength":     strength,
-        "start_ts":     time.time(),
-        "entry_bucket": entry_bucket,
-        "best_price":   price,
-    }
 
     with state.lock:
         state.pending_entries.add((symbol, "main"))
