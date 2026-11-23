@@ -724,7 +724,7 @@ def fetch_control_commands():
                 send_telegram(
                     f"📋 FastBand 명령어 (APP {state.APP_ID})\n\n"
                     f"🟢 거래제어\n켜 / 꺼 / 청산 / 상태 / 초기화\n\n"
-                    f"🚀 실매매 버전 (A/B/C — 하나를 켜면 나머지는 자동 OFF, 재시작 기본은 A)\n"
+                    f"🚀 실매매 버전 (A/B/C — 하나를 켜면 나머지는 자동 OFF, 재시작 기본은 B)\n"
                     f"a버전켜 / a버전꺼\n"
                     f"  A: 기존 매매 — 볼린저 3σ 오버슈팅 + 추가이격 + 슬라이딩 지정가\n"
                     f"b버전켜 / b버전꺼\n"
