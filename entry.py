@@ -784,6 +784,17 @@ def _b_version_confirm_and_enter(
             )
             return
 
+        # 판정 중 매매 OFF / 이미 포지션·주문이 생긴 경우 → 주문하지 않는다 (안전 가드)
+        if not state.trading_enabled:
+            _log_entry_blocked(signal_id, "BLOCKED_TRADING_OFF", "TRADING_OFF_DURING_CONFIRM", trade_version=version)
+            return
+        if get_real_position_size(symbol) > 0:
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "POSITION_ALREADY_OPEN", trade_version=version)
+            return
+        if get_real_open_orders(symbol):
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "OPEN_ORDER_EXISTS", trade_version=version)
+            return
+
         # ── 현재가 즉시 체결 주문 (시장가) ──
         sz = _entry_order_size(symbol, enter_px, order_usdt)
         if sz <= 0:
