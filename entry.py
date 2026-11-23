@@ -13,6 +13,7 @@ from okx_api import (
     close_position_oco_checked,
     wait_position_visible,
     adjust_size, place_market_order, cancel_algo_order,
+    get_last_order_error,
 )
 from indicators import (
     get_bollinger, get_volume_ratio, get_adx, get_rsi,
@@ -544,6 +545,34 @@ def _track_shadow_versions(symbol, signal_id, side, signal_price, entry_target):
             pass
 
 
+# ✅ [v3.1] 진입이 실제로 일어나지 않은 경우에도 trade_log의 result가 'PENDING'으로
+#   영원히 남지 않도록, 원인을 구분해 남긴다. (기존 BLOCKED_VOL / CANCEL_CANDLE / MISS / HIT 분기는 그대로)
+def _log_entry_blocked(signal_id, result, reason=None, **extra):
+    payload = {"result": result}
+    if reason:
+        payload["block_reason"] = reason
+    payload.update({k: v for k, v in extra.items() if v is not None})
+    try:
+        _upsert_trade_log(signal_id, payload)
+    except Exception as ex:
+        print(f"[_log_entry_blocked] {signal_id} 로그 실패: {ex}")
+
+
+def _log_order_fail(signal_id, symbol):
+    """place_limit_order 실패 사유(잔고 부족 51008 / 주문 거부 / 수량 0)를 구분해 기록"""
+    err    = get_last_order_error(symbol) or {}
+    reason = err.get("reason") or "ORDER_REJECTED"
+    _log_entry_blocked(
+        signal_id,
+        "NO_BALANCE" if reason == "NO_BALANCE" else "ORDER_FAIL",
+        reason,
+        order_sCode=err.get("sCode"),
+        order_sMsg=err.get("sMsg"),
+        order_size=err.get("size"),
+        order_usdt=err.get("usdt"),
+    )
+
+
 def _delayed_confirm_and_enter(
     signal_id, symbol, initial_price, initial_side,
     base, entry_bucket, strength, zone,
@@ -554,16 +583,20 @@ def _delayed_confirm_and_enter(
         _, SLIDING_TOTAL, ENTRY_WAIT, _ = get_sliding_params_by_zone(zone)
 
         if get_real_position_size(symbol) > 0:
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "POSITION_ALREADY_OPEN")
             return
         if get_real_open_orders(symbol):
+            _log_entry_blocked(signal_id, "SKIP_POSITION", "OPEN_ORDER_EXISTS")
             return
         if not set_leverage(symbol, cfg.LEVERAGE):
+            _log_entry_blocked(signal_id, "ORDER_FAIL", "LEVERAGE_FAIL")
             send_telegram(f"❌ 레버리지 설정 실패 - {symbol}")
             return
 
         time.sleep(state.ENTRY_DELAY_SEC)
 
         if state.bar_state[symbol]["bucket"] != entry_bucket:
+            _log_entry_blocked(signal_id, "STALE_CANDLE", "CANDLE_CHANGED_BEFORE_ORDER")
             return
 
         if state.vol_exhausted_filter_enabled:
@@ -620,6 +653,7 @@ def _delayed_confirm_and_enter(
 
         main_id = place_limit_order(symbol, initial_side, target, main_usdt)
         if not main_id:
+            _log_order_fail(signal_id, symbol)
             send_telegram(f"❌ 주문 실패 - {symbol}")
             return
 
@@ -713,6 +747,7 @@ def _delayed_confirm_and_enter(
 
                 main_id = place_limit_order(symbol, initial_side, last_target, main_usdt)
                 if not main_id:
+                    _log_order_fail(signal_id, symbol)
                     return
 
             time.sleep(0.3)
@@ -1272,22 +1307,12 @@ def try_enter_on_price(symbol, price):
            if signal_type == "10M+1H" else "")
     )
 
-    if not state.trading_enabled:
-        return
-
-    state.sliding_state[symbol] = {
-        "signal_id":    signal_id,
-        "side":         initial_side,
-        "base":         base,
-        "zone":         zone,
-        "strength":     strength,
-        "start_ts":     time.time(),
-        "entry_bucket": entry_bucket,
-        "best_price":   price,
-    }
-
-    size_mult = cfg.ZONE_SIZE_MULT.get(zone, 1.0)
-    main_usdt = state.usdt_amount * size_mult
+    # ✅ [v3.1] 매매 OFF(알람 전용)여도 '알람이 나간 신호'는 3버전 가상 분석을 남긴다.
+    #   - 알람 전용: trade_log(결과 ALARM_ONLY) + _track_shadow_versions 만 실행
+    #   - 실매매 ON: 기존과 동일 (슬라이딩 / 주문 / 진입 대기)
+    #   ⚠️ sliding_state는 매매 ON일 때만 설정한다. 알람 전용에서 설정하면
+    #      finally의 pop이 돌지 않아 try_enter_on_price가 그 종목을 계속 삼키게 된다.
+    alarm_only = not state.trading_enabled
 
     _upsert_trade_log(signal_id, {
         "symbol":              symbol,
@@ -1318,7 +1343,8 @@ def try_enter_on_price(symbol, price):
         "mfe_pct":             None,
         "mae_pct":             None,
         "max_profit_pct":      None,
-        "result":              "PENDING",
+        "trading_enabled":     state.trading_enabled,
+        "result":              "ALARM_ONLY" if alarm_only else "PENDING",
         "entry":               None,
         "exit_price":          None,
         "exit_reason":         None,
@@ -1326,10 +1352,6 @@ def try_enter_on_price(symbol, price):
         "pnl_pct":             None,
         "timestamp":           time.time(),
     })
-
-    with state.lock:
-        state.pending_entries.add((symbol, "main"))
-        state.last_entry_time[symbol] = time.time()
 
     Thread(
         target=_track_signal_timeline,
@@ -1344,6 +1366,28 @@ def try_enter_on_price(symbol, price):
         args=(symbol, signal_id, initial_side, price, target_price),
         daemon=True,
     ).start()
+
+    # 매매 OFF(알람 전용)는 여기까지 — 주문·포지션·슬라이딩 상태는 건드리지 않는다.
+    if alarm_only:
+        return
+
+    size_mult = cfg.ZONE_SIZE_MULT.get(zone, 1.0)
+    main_usdt = state.usdt_amount * size_mult
+
+    state.sliding_state[symbol] = {
+        "signal_id":    signal_id,
+        "side":         initial_side,
+        "base":         base,
+        "zone":         zone,
+        "strength":     strength,
+        "start_ts":     time.time(),
+        "entry_bucket": entry_bucket,
+        "best_price":   price,
+    }
+
+    with state.lock:
+        state.pending_entries.add((symbol, "main"))
+        state.last_entry_time[symbol] = time.time()
 
     Thread(
         target=_delayed_confirm_and_enter,

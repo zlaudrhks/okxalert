@@ -219,8 +219,25 @@ def cancel_algo_order(symbol, algo_id):
         print("cancel_algo_order 예외:", e)
         return False
 
+# ✅ [v3.1] 진입 주문 실패 사유 전달용
+#   trade_log에서 result=PENDING으로 방치되지 않도록, 주문이 안 된 원인을 호출측(entry.py)이 읽어간다.
+#   (잔고 부족 51008 → NO_BALANCE, 그 외 거부 → ORDER_REJECTED, 수량 0 → SIZE_TOO_SMALL 등)
+LAST_ORDER_ERROR = {}
+
+
+def get_last_order_error(symbol):
+    return LAST_ORDER_ERROR.get(symbol)
+
+
+def _set_last_order_error(symbol, reason, s_code="", s_msg="", **extra):
+    info = {"reason": reason, "sCode": s_code or "", "sMsg": s_msg or ""}
+    info.update(extra)
+    LAST_ORDER_ERROR[symbol] = info
+
+
 def place_limit_order(symbol, side, target_price, order_usdt):
     if not state.trading_enabled:
+        _set_last_order_error(symbol, "TRADING_OFF")
         return None
 
     meta  = state.instrument_meta.get(symbol, {"ctVal": 1, "lotSz": 1, "tickSz": 1, "minSz": 1})
@@ -230,11 +247,14 @@ def place_limit_order(symbol, side, target_price, order_usdt):
 
     px = round_to_tick(symbol, target_price)
     if px <= 0:
+        _set_last_order_error(symbol, "BAD_PRICE")
         return None
 
     contracts = order_usdt / (px * ctVal)
     sz        = adjust_size(contracts, lotSz, minSz)
     if sz <= 0:
+        _set_last_order_error(symbol, "SIZE_TOO_SMALL",
+                              size=sz, usdt=order_usdt, px=px)
         return None
 
     actual_usdt = sz * px * ctVal
@@ -244,6 +264,8 @@ def place_limit_order(symbol, side, target_price, order_usdt):
     elif ratio < 0.98:
         sz = adjust_size(sz + lotSz, lotSz, minSz)
     if sz <= 0:
+        _set_last_order_error(symbol, "SIZE_TOO_SMALL",
+                              size=sz, usdt=order_usdt, px=px)
         return None
 
     def _do_order(order_px, order_sz):
@@ -269,10 +291,12 @@ def place_limit_order(symbol, side, target_price, order_usdt):
         pass
 
     if res.get("code") == "0":
+        LAST_ORDER_ERROR.pop(symbol, None)
         return res["data"][0]["ordId"]
 
     # ✅ 51155: 지역 제한 → 블랙리스트 저장 후 포기
     if s_code == "51155":
+        _set_last_order_error(symbol, "REGION_BLOCKED", s_code, s_msg)
         state.SYMBOL_BLACKLIST.add(symbol)
         _save_blacklist()
         print(f"[place_limit_order] {symbol} 지역 제한 → 블랙리스트 추가")
@@ -313,6 +337,13 @@ def place_limit_order(symbol, side, target_price, order_usdt):
     state.last_failed_order_time[symbol] = time.time()
     if s_code == "51008":
         state.last_failed_order_time[symbol] = time.time() + 300
+    # ✅ [v3.1] 잔고 부족(51008)과 그 외 주문 거부를 구분해 남긴다
+    _set_last_order_error(
+        symbol,
+        "NO_BALANCE" if s_code == "51008" else "ORDER_REJECTED",
+        s_code, s_msg,
+        size=sz, usdt=order_usdt, px=px,
+    )
     send_telegram(f"❌ ENTRY 주문 실패 - {symbol}\n{res}")
     return None
 
